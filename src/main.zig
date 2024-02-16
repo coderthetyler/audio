@@ -13,6 +13,7 @@ const DEBUG = true;
 // - "Atomic Weapons: The C++ Memory Model and Modern Hardware", Herb Sutter, C++ and Beyond 2012
 
 pub fn main() !void {
+    // TODO try to recover from response queue overrun
     // TODO master gain control
     // TODO per-source gain control
     // TODO macos backend
@@ -322,6 +323,7 @@ const MixerRequest = struct {
 };
 const MixerResponseType = enum {
     tooManySounds,
+    tooManySources,
     soundRegistered,
     soundUnregistered,
     sourceRemoved,
@@ -332,12 +334,16 @@ const MixerResponse = struct {
     id: usize, // response has same ID has request
     payload: union(MixerResponseType) {
         tooManySounds: Sound,
+        tooManySources: Source,
         soundRegistered: Sound,
         soundUnregistered: Sound,
         sourceRemoved: Source,
         sourceAdded: Source,
         sourceCompleted: Source,
     },
+    pub fn tooManySources(req: MixerRequest, source: Source) @This() {
+        return .{ .id = req.id, .payload = .{ .tooManySources = source } };
+    }
     pub fn tooManySounds(req: MixerRequest, sound: Sound) @This() {
         return .{ .id = req.id, .payload = .{ .tooManySounds = sound } };
     }
@@ -375,7 +381,7 @@ const Middleware = struct {
     // Shared by mixer & audio thread
     var requestQueue: MpScRingFifo(MixerRequest, MAX_EVENTS) = undefined;
     var responseQueue: SpScRingFifo(MixerResponse, MAX_EVENTS) = undefined;
-    var isResponseQueueOverrun: Atomic(bool) = undefined;
+    var isResponseQueueInOverrun: Atomic(bool) = undefined;
 
     // Performance statistics (DEBUG ONLY)
     var targetNs = Atomic(i64).init(0);
@@ -387,7 +393,7 @@ const Middleware = struct {
         sounds = Swapback(Sound, MAX_SOUNDS).init();
         requestQueue = MpScRingFifo(MixerRequest, MAX_EVENTS).init();
         responseQueue = SpScRingFifo(MixerResponse, MAX_EVENTS).init();
-        isResponseQueueOverrun = Atomic(bool).init(false);
+        isResponseQueueInOverrun = Atomic(bool).init(false);
     }
 
     /// Not safe to call this until mixer thread has joined the main thread
@@ -400,6 +406,10 @@ const Middleware = struct {
 
     /// Called from audio thread to process events from mixer thread
     fn processEvents() void {
+        if (isResponseQueueInOverrun.load(.Monotonic)) {
+            warn("processEvents() too slow, possibly leaking memory or corrupting playback state", .{});
+            isResponseQueueInOverrun.store(false, .Monotonic);
+        }
         debug("targetNs = {d}, processNs = {d}\n", .{ targetNs.load(.SeqCst), processNs.load(.SeqCst) });
         while (responseQueue.realtimeRead()) |resp| {
             debug("resp {d}- {any}\n", .{ resp.id, resp.payload });
@@ -423,6 +433,9 @@ const Middleware = struct {
                 .tooManySounds => |sound| {
                     std.debug.print("Too many sounds, unloading {d}\n", .{sound.id});
                     sound.free();
+                },
+                .tooManySources => |source| {
+                    std.debug.print("Too many sources, not playing {d}\n", .{source.id});
                 },
             }
         }
@@ -477,7 +490,8 @@ const Middleware = struct {
             };
             sources.add(source) catch |err| switch (err) {
                 error.Overrun => {
-                    // TODO error: too many sources!
+                    mixerSendResponse(MixerResponse.tooManySources(request, source));
+                    return;
                 },
             };
             mixerSendResponse(MixerResponse.sourceAdded(request, source));
@@ -544,7 +558,9 @@ const Middleware = struct {
     }
     inline fn mixerSendResponse(resp: MixerResponse) void {
         responseQueue.realtimeWrite(resp) catch |err| switch (err) {
-            error.Overrun => unreachable,
+            error.Overrun => {
+                isResponseQueueInOverrun.store(true, .Monotonic);
+            },
         };
     }
     inline fn mixerFindSound(id: u64) ?usize {
@@ -665,7 +681,7 @@ const AlsaBackend = struct {
 
         _ = c.snd_pcm_prepare(player);
 
-        mixerThread = try std.Thread.spawn(.{}, audio_thread_worker, .{});
+        mixerThread = try std.Thread.spawn(.{}, mixer_thread_worker, .{});
         try mixerThread.setName("Mixer");
     }
 
@@ -675,7 +691,7 @@ const AlsaBackend = struct {
         _ = c.snd_pcm_close(player);
     }
 
-    fn audio_thread_worker() void {
+    fn mixer_thread_worker() void {
         var err: c_int = undefined;
         while (!shutdownRequested.load(.Monotonic)) {
             err = c.snd_pcm_wait(player, 1000);
