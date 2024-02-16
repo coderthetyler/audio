@@ -1,10 +1,4 @@
 .{
-    .name = "linux-audio",
+    .name = "audio",
     .version = "0.0.1",
-    .dependencies = .{
-        .zig_alsa = .{ 
-            .url = "https://github.com/coderthetyler/zig-alsa/archive/refs/tags/test-v1.2.8.tar.gz",
-            .hash = "1220d5d724b9d01958dc3c536d509f6c5b91e789c2f95eb46c99579f89f79fa2c23b",
-        }
-    }
 }
