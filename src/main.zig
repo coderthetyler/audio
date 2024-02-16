@@ -2,48 +2,34 @@ const std = @import("std");
 const c = @import("alsa.zig");
 const Atomic = std.atomic.Atomic;
 
+const DEBUG = true;
+
 // resources:
 // - "C++ in the Audio Industry", Timur Doumler, CppCon 2015
 // - "Thread Synchronization In Real-Time Audio Processing with RCU (Read-Copy-Update)", Timur Doumler
 // - "C++ atomics, from basic to advanced", Fedor Pikus, CppCon 2017
 // - "Read, Copy, Update, then what? RCU for non-kernel programmers", Fedor Pikus, CppCon 2017
 // - "Real time 101", David Rowland & Fabian Renn Giles, Meeting C++ 2019
-
-// things an audio PAL can do:
-// - list playback devices
-// - change playback device
-// - react to changes in devices
-// - adjust playback volume
-// - consume render callback
-
-// - deferred reclamation
-// - publishing protocol (mutex, spin lock (atomic), atomic data, CAS exchange loop)
-// - RCU
-
-// sound card sends interrupt to CPU after each period
-// typically, the period size is half the buffer size, i.e. double buffering
-// sound cards have their own constraints on valid values for the period size & buffer size
-// latency is determined by the buffer size & sample rate: samples / samples/sec = sec
-
-// idea: budget memory allocations for sound
-// TODO research deferred reclamation
-// TODO spin-on-write pointer swap impl
-
-fn getInt(idStr: []const u8) ?u64 {
-    const id = std.fmt.parseInt(u64, idStr, 10) catch |err| switch (err) {
-        error.Overflow => {
-            std.debug.print("Input too large: {s}\n", .{idStr});
-            return null;
-        },
-        error.InvalidCharacter => {
-            std.debug.print("Not an integer: {s}\n", .{idStr});
-            return null;
-        },
-    };
-    return id;
-}
+// - "Atomic Weapons: The C++ Memory Model and Modern Hardware", Herb Sutter, C++ and Beyond 2012
 
 pub fn main() !void {
+    // TODO master gain control
+    // TODO per-source gain control
+    // TODO macos backend
+    // TODO DSP effects on sources
+    // TODO audio engine state machine
+    // TODO benchmark fifos
+    // TODO less awkward Sound.render() API
+    // TODO set ALSA backend thread priority
+    // TODO pin event queue pages
+    // TODO budget memory allocations for sound; actually have a counter for all audio memory usage
+    // TODO enumerate & select playback device
+
+    debug("@sizeOf(MixerRequest) = {d}\n", .{@sizeOf(MixerRequest)});
+    debug("@sizeOf(MixerResponse) = {d}\n", .{@sizeOf(MixerResponse)});
+    debug("@sizeOf(Middleware.requestQueue) = {d}\n", .{@sizeOf(@TypeOf(Middleware.requestQueue))});
+    debug("@sizeOf(Middleware.responseQueue) = {d}\n", .{@sizeOf(@TypeOf(Middleware.responseQueue))});
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const alloc = gpa.allocator();
     defer _ = gpa.deinit();
@@ -58,45 +44,62 @@ pub fn main() !void {
     var buffer: [1024]u8 = undefined;
     const stdin = std.io.getStdIn();
     var stdinReader = stdin.reader();
+    std.debug.print("> ", .{});
     while (try stdinReader.readUntilDelimiterOrEof(&buffer, '\n')) |line| {
-        if (std.mem.eql(u8, line, "q")) {
+        if (line.len == 0) {
+            // do nothing
+        } else if (std.mem.eql(u8, line, "quit")) {
             break;
-        } else if (line.len >= 2 and std.mem.eql(u8, line[0..1], "l")) {
-            const soundPath = line[2..];
-            const sound = Middleware.loadSound(soundPath) catch |err| switch (err) {
+        } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "sine")) {
+            if (parseInt(line[4 + 1 ..])) |freq| {
+                _ = Middleware.requestSine(@intCast(freq));
+            }
+        } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "loop")) {
+            if (parseInt(line[4 + 1 ..])) |id| {
+                _ = Middleware.requestPlaySound(SourceParams{
+                    .soundId = id,
+                    .startTime = 0,
+                    .loop = true,
+                    .paused = false,
+                });
+            }
+        } else if (line.len >= 3 + 1 and std.mem.eql(u8, line[0..3], "wav")) {
+            const soundPath = line[3 + 1 ..];
+            _ = Middleware.requestWav(soundPath) catch |err| switch (err) {
                 error.BadSoundFile => {
-                    std.debug.print("Bad sound file: {s}\n", .{soundPath});
-                    continue;
+                    warn("Bad sound file: {s}\n", .{soundPath});
                 },
             };
-            std.debug.print("Load success: {s}, id={d}\n", .{ soundPath, sound.id });
-        } else if (line.len >= 2 and std.mem.eql(u8, line[0..1], "u")) {
-            const soundId = getInt(line[2..]).?;
-            Middleware.requestUnloadSound(soundId);
-            std.debug.print("Unload sound requested: {d}\n", .{soundId});
-        } else if (line.len >= 2 and std.mem.eql(u8, line[0..1], "p")) {
-            const idStr = line[2..];
-            const id = getInt(idStr) orelse continue;
-            const sourceId = Middleware.requestPlaySound(SourceParams{
-                .soundId = id,
-                .startTime = 0,
-                .loop = false,
-                .paused = false,
-            });
-            std.debug.print("Play sound requested {d}\n", .{sourceId});
-        } else if (line.len >= 2 and std.mem.eql(u8, line[0..1], "k")) {
-            const idStr = line[2..];
-            const id = getInt(idStr) orelse continue;
-            Middleware.requestRemoveSource(id);
-            std.debug.print("Killed {d}\n", .{id});
-        } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "sine")) {
-            const freq = getInt(line[5..]).?;
-            const sine = Middleware.addSine(@intCast(freq));
-            std.debug.print("Add sine request: {any}\n", .{sine});
+        } else if (line.len >= 6 + 1 and std.mem.eql(u8, line[0..6], "unload")) {
+            if (parseInt(line[6 + 1 ..])) |id| {
+                Middleware.requestUnregisterSound(id);
+            }
+        } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "play")) {
+            if (parseInt(line[4 + 1 ..])) |id| {
+                _ = Middleware.requestPlaySound(SourceParams{
+                    .soundId = id,
+                    .startTime = 0,
+                    .loop = false,
+                    .paused = false,
+                });
+            }
+        } else if (line.len >= 3 + 1 and std.mem.eql(u8, line[0..3], "end")) {
+            if (parseInt(line[3 + 1 ..])) |id| {
+                Middleware.requestRemoveSource(id);
+            }
+        } else if (line.len >= 5 + 1 and std.mem.eql(u8, line[0..5], "pause")) {
+            if (parseInt(line[5 + 1 ..])) |id| {
+                Middleware.requestPauseSource(id);
+            }
+        } else if (line.len >= 7 + 1 and std.mem.eql(u8, line[0..7], "unpause")) {
+            if (parseInt(line[7 + 1 ..])) |id| {
+                Middleware.requestResumeSource(id);
+            }
         } else {
-            std.debug.print("unknown cmd: {s}\n", .{line});
+            std.debug.print("Unknown cmd: {s}\n", .{line});
         }
         Middleware.processEvents();
+        std.debug.print("> ", .{});
     }
     std.debug.print("Goodbye\n", .{});
 }
@@ -125,12 +128,11 @@ const Source = struct {
             @memset(target, 0.0);
             return;
         }
-        const framesWritten = self.sound.data.read(self.time, target);
+        const framesWritten = self.sound.read(self.time, target, self.loop);
         if (framesWritten != target.len) {
             self.isComplete = true;
         }
         self.time += framesWritten;
-        // TODO implement loop
     }
 };
 
@@ -140,47 +142,38 @@ const SoundType = enum {
     wav,
     sine,
 };
-const SoundData = union(SoundType) {
-    wav: Wav,
-    sine: Sine,
-
-    fn read(self: @This(), from: usize, target: []f32) usize {
-        return switch (self) {
-            .wav => |wav| wav.read(from, target),
-            .sine => |sin| sin.read(from, target),
-        };
-    }
-
-    fn free(self: @This()) void {
-        switch (self) {
-            .wav => |wav| wav.free(Middleware.wavAllocator),
-            .sine => {},
-        }
-    }
-};
 const Sound = struct {
     var idGen = Atomic(u64).init(0);
 
     id: u64,
-    data: SoundData,
-
-    fn init(data: SoundData) @This() {
-        return .{
-            .id = idGen.fetchAdd(1, .Monotonic),
-            .data = data,
-        };
-    }
-
-    fn free(self: @This()) void {
-        self.data.free();
-    }
+    data: union(SoundType) {
+        wav: Wav,
+        sine: Sine,
+    },
 
     fn loadWav(allocator: std.mem.Allocator, path: []const u8) !@This() {
-        return init(.{ .wav = try Wav.load(allocator, path) });
+        return .{
+            .id = idGen.fetchAdd(1, .Monotonic),
+            .data = .{ .wav = try Wav.load(allocator, path) },
+        };
     }
-
     fn sine(rate: u32, channels: u32, hz: u32) @This() {
-        return init(.{ .sine = .{ .rate = rate, .channels = channels, .hz = hz } });
+        return .{
+            .id = idGen.fetchAdd(1, .Monotonic),
+            .data = .{ .sine = .{ .rate = rate, .channels = channels, .hz = hz } },
+        };
+    }
+    fn read(self: @This(), from: usize, target: []f32, loop: bool) usize {
+        return switch (self.data) {
+            .wav => |wav| wav.read(from, target, loop),
+            .sine => |sin| sin.read(from, target),
+        };
+    }
+    fn free(self: @This()) void {
+        switch (self.data) {
+            .wav => |wav| wav.free(Middleware.wavAllocator),
+            .sine => {},
+        }
     }
 };
 const Sine = struct {
@@ -232,6 +225,8 @@ pub const Wav = struct {
         }
         const sampleCount = data.len * @sizeOf(u8) / @sizeOf(i16);
 
+        // TODO support stereo & mono
+        // TODO support other bit depths, convert automatically to f32
         // TODO something something little/big endian
         const rawSamples = @as([*]i16, @ptrCast(@alignCast(data.ptr)))[0..@intCast(sampleCount)];
         const samples = try allocator.alloc(f32, sampleCount);
@@ -249,13 +244,19 @@ pub const Wav = struct {
         };
     }
 
-    fn read(self: @This(), from: usize, target: []f32) usize {
-        if (from >= self.samples.len) return 0;
-        const remainingFrames = self.samples.len - from;
-        const framesToWrite = @min(target.len, remainingFrames);
-        @memcpy(target[0..framesToWrite], self.samples[from .. from + framesToWrite]);
+    fn read(self: @This(), from: usize, target: []f32, loop: bool) usize {
+        if (!loop and from >= self.samples.len) return 0;
+        const fromMod = from % self.samples.len;
+        const remainingFrames = self.samples.len - fromMod;
+        var framesToWrite = @min(target.len, remainingFrames);
+        @memcpy(target[0..framesToWrite], self.samples[fromMod .. fromMod + framesToWrite]);
         if (framesToWrite != target.len) {
-            @memset(target[framesToWrite..], 0.0);
+            if (loop) {
+                @memcpy(target[framesToWrite..], self.samples[0 .. target.len - framesToWrite]);
+                framesToWrite = target.len;
+            } else {
+                @memset(target[framesToWrite..], 0.0);
+            }
         }
         // TODO generalize to support arbitrary channel counts & not just stereo
         // TODO must be that sample rate matches playback rate
@@ -271,29 +272,90 @@ pub const Wav = struct {
     }
 };
 
-const MixerNotificationType = enum {
+const MixerRequestType = enum {
     registerSound,
     unregisterSound,
     playSound,
     removeSource,
+    pauseSource,
+    resumeSource,
 };
-const MixerNotification = union(MixerNotificationType) {
-    registerSound: Sound,
-    unregisterSound: u64,
-    playSound: SourceParams,
-    removeSource: u64,
+const MixerRequest = struct {
+    var idGen = Atomic(usize).init(0);
+
+    id: usize,
+    payload: union(MixerRequestType) {
+        registerSound: Sound,
+        unregisterSound: u64,
+        playSound: SourceParams,
+        removeSource: u64,
+        pauseSource: u64,
+        resumeSource: u64,
+    },
+
+    pub fn registerSound(sound: Sound) @This() {
+        return create(.{ .registerSound = sound });
+    }
+    pub fn unregisterSound(id: u64) @This() {
+        return create(.{ .unregisterSound = id });
+    }
+    pub fn playSound(params: SourceParams) @This() {
+        return create(.{ .playSound = params });
+    }
+    pub fn removeSource(id: u64) @This() {
+        return create(.{ .removeSource = id });
+    }
+    pub fn pauseSource(id: u64) @This() {
+        return create(.{ .pauseSource = id });
+    }
+    pub fn resumeSource(id: u64) @This() {
+        return create(.{ .resumeSource = id });
+    }
+    fn create(payload: anytype) @This() {
+        const req = .{
+            .id = idGen.fetchAdd(1, .Monotonic),
+            .payload = payload,
+        };
+        debug("req {d}- {any}\n", .{ req.id, req.payload });
+        return req;
+    }
 };
 const MixerResponseType = enum {
+    tooManySounds,
+    soundRegistered,
     soundUnregistered,
     sourceRemoved,
     sourceAdded,
     sourceCompleted,
 };
-const MixerResponse = union(MixerResponseType) {
-    soundUnregistered: Sound,
-    sourceRemoved: Source,
-    sourceAdded: Source,
-    sourceCompleted: Source,
+const MixerResponse = struct {
+    id: usize, // response has same ID has request
+    payload: union(MixerResponseType) {
+        tooManySounds: Sound,
+        soundRegistered: Sound,
+        soundUnregistered: Sound,
+        sourceRemoved: Source,
+        sourceAdded: Source,
+        sourceCompleted: Source,
+    },
+    pub fn tooManySounds(req: MixerRequest, sound: Sound) @This() {
+        return .{ .id = req.id, .payload = .{ .tooManySounds = sound } };
+    }
+    pub fn soundRegistered(req: MixerRequest, sound: Sound) @This() {
+        return .{ .id = req.id, .payload = .{ .soundRegistered = sound } };
+    }
+    pub fn soundUnregistered(req: MixerRequest, sound: Sound) @This() {
+        return .{ .id = req.id, .payload = .{ .soundUnregistered = sound } };
+    }
+    pub fn sourceRemoved(req: MixerRequest, source: Source) @This() {
+        return .{ .id = req.id, .payload = .{ .sourceRemoved = source } };
+    }
+    pub fn sourceAdded(req: MixerRequest, source: Source) @This() {
+        return .{ .id = req.id, .payload = .{ .sourceAdded = source } };
+    }
+    pub fn sourceCompleted(source: Source) @This() {
+        return .{ .id = MixerRequest.idGen.fetchAdd(1, .Monotonic), .payload = .{ .sourceCompleted = source } };
+    }
 };
 
 const Middleware = struct {
@@ -303,106 +365,108 @@ const Middleware = struct {
     const MAX_SOUNDS: usize = 4;
     const MAX_EVENTS: usize = 64;
 
+    // Owned by audio thread
     var wavAllocator: std.mem.Allocator = undefined;
 
-    // written by non-rt threads, read by rt mixer thread
-    var mixerNotificationQueue: MpScRingFifo(MixerNotification, MAX_EVENTS) = undefined;
-    var mixerResponseQueue: SpScRingFifo(MixerResponse, MAX_EVENTS) = undefined;
-
-    // mutated on rt mixer thread, do not read from other threads
+    // Owned by mixer thread
     var sources: Swapback(Source, MAX_SOURCES) = undefined;
     var sounds: Swapback(Sound, MAX_SOUNDS) = undefined;
+
+    // Shared by mixer & audio thread
+    var requestQueue: MpScRingFifo(MixerRequest, MAX_EVENTS) = undefined;
+    var responseQueue: SpScRingFifo(MixerResponse, MAX_EVENTS) = undefined;
+    var isResponseQueueOverrun: Atomic(bool) = undefined;
+
+    // Performance statistics (DEBUG ONLY)
+    var targetNs = Atomic(i64).init(0);
+    var processNs = Atomic(i64).init(0);
 
     fn init(allocator: std.mem.Allocator) void {
         wavAllocator = allocator;
         sources = Swapback(Source, MAX_SOURCES).init();
         sounds = Swapback(Sound, MAX_SOUNDS).init();
-        mixerNotificationQueue = MpScRingFifo(MixerNotification, MAX_EVENTS).init();
+        requestQueue = MpScRingFifo(MixerRequest, MAX_EVENTS).init();
+        responseQueue = SpScRingFifo(MixerResponse, MAX_EVENTS).init();
+        isResponseQueueOverrun = Atomic(bool).init(false);
     }
 
+    /// Not safe to call this until mixer thread has joined the main thread
     fn shutdown() void {
+        processEvents(); // take ownership of any straggling in-flight events
         for (0..sounds.len()) |i| {
-            switch (sounds.get(i).data) {
-                .wav => |wav| {
-                    wav.free(wavAllocator);
-                },
-                .sine => {},
-            }
+            sounds.get(i).free();
         }
     }
 
-    /// Processes events from the realtime mixer thread
+    /// Called from audio thread to process events from mixer thread
     fn processEvents() void {
-        while (mixerResponseQueue.realtimeRead()) |resp| {
-            switch (resp) {
+        debug("targetNs = {d}, processNs = {d}\n", .{ targetNs.load(.SeqCst), processNs.load(.SeqCst) });
+        while (responseQueue.realtimeRead()) |resp| {
+            debug("resp {d}- {any}\n", .{ resp.id, resp.payload });
+            switch (resp.payload) {
+                .soundRegistered => |sound| {
+                    std.debug.print("Sound registered: {d}\n", .{sound.id});
+                },
                 .soundUnregistered => |sound| {
                     sound.free();
+                    std.debug.print("Sound freed: {d}\n", .{sound.id});
                 },
                 .sourceRemoved => |source| {
-                    _ = source;
+                    std.debug.print("Source removed: {d}\n", .{source.id});
                 },
                 .sourceAdded => |source| {
-                    _ = source;
+                    std.debug.print("Source added: {d}\n", .{source.id});
                 },
                 .sourceCompleted => |source| {
-                    _ = source;
+                    std.debug.print("Source completed: {d}\n", .{source.id});
+                },
+                .tooManySounds => |sound| {
+                    std.debug.print("Too many sounds, unloading {d}\n", .{sound.id});
+                    sound.free();
                 },
             }
         }
     }
-
-    /// Synchronously load a sound, then notify mixer thread that sound is available.
-    fn loadSound(path: []const u8) !Sound {
+    fn requestWav(path: []const u8) !Sound {
         const s = Sound.loadWav(wavAllocator, path) catch return error.BadSoundFile;
-        mixerNotificationQueue.spinWrite(MixerNotification{ .registerSound = s }) catch |err| switch (err) {
-            error.Overrun => {
-                std.debug.print("Event queue overrun!\n", .{});
-            },
-        };
+        debug("WAV loaded: {d} = {s}\n", .{ s.id, path });
+        sendRequest(MixerRequest.registerSound(s));
         return s;
     }
-
-    fn addSine(hz: u32) Sound {
+    fn requestSine(hz: u32) Sound {
         const s = Sound.sine(44100, 1, hz);
-        mixerNotificationQueue.spinWrite(MixerNotification{ .registerSound = s }) catch |err| switch (err) {
-            error.Overrun => {
-                std.debug.print("Event queue overrun!\n", .{});
-            },
-        };
+        sendRequest(MixerRequest.registerSound(s));
         return s;
     }
-
-    /// Notify mixer thread that sound should no longer be used.
-    /// Cannot clean up sound resources until mixer thread notifies us that the sound is no longer in use.
-    fn requestUnloadSound(id: u64) void {
-        mixerNotificationQueue.spinWrite(MixerNotification{ .unregisterSound = id }) catch |err| switch (err) {
-            error.Overrun => {
-                std.debug.print("Event queue overrun!\n", .{});
-            },
-        };
+    fn requestUnregisterSound(id: u64) void {
+        sendRequest(MixerRequest.unregisterSound(id));
     }
-
     fn requestPlaySound(params: SourceParams) u64 {
         var modifiedParams = params;
         modifiedParams.id = Source.idGen.fetchAdd(1, .Monotonic);
-        mixerNotificationQueue.spinWrite(MixerNotification{ .playSound = modifiedParams }) catch |err| switch (err) {
-            error.Overrun => {
-                std.debug.print("Event queue overrun!\n", .{});
-            },
-        };
+        sendRequest(MixerRequest.playSound(modifiedParams));
         return modifiedParams.id;
     }
-
     fn requestRemoveSource(id: u64) void {
-        mixerNotificationQueue.spinWrite(MixerNotification{ .removeSource = id }) catch |err| switch (err) {
+        sendRequest(MixerRequest.removeSource(id));
+    }
+    fn requestPauseSource(id: u64) void {
+        sendRequest(MixerRequest.pauseSource(id));
+    }
+    fn requestResumeSource(id: u64) void {
+        sendRequest(MixerRequest.resumeSource(id));
+    }
+    inline fn sendRequest(req: MixerRequest) void {
+        requestQueue.spinWrite(req) catch |err| switch (err) {
             error.Overrun => {
-                std.debug.print("Event queue overrun!\n", .{});
+                warn("Request queue overrun! Discarding request.\n", .{});
             },
         };
     }
 
-    inline fn rtPlaySound(params: SourceParams) void {
-        if (findSound(params.soundId)) |i| {
+    // Called from the mixer thread to process requests from the audio thread
+    inline fn mixerPlaySound(request: MixerRequest, params: SourceParams) void {
+        if (mixerFindSound(params.soundId)) |i| {
             const sound = &sounds.data[i];
             const source = Source{
                 .id = params.id,
@@ -416,41 +480,32 @@ const Middleware = struct {
                     // TODO error: too many sources!
                 },
             };
+            mixerSendResponse(MixerResponse.sourceAdded(request, source));
         } else {
             // TODO error: no sound with index
         }
     }
-
-    inline fn rtRemoveSource(id: u64) void {
-        if (findSource(id)) |i| {
+    inline fn mixerRemoveSource(request: MixerRequest, id: u64) void {
+        if (mixerFindSource(id)) |i| {
             const removedSource = sources.removeAt(i) catch |err| switch (err) {
-                error.InvalidIndex => {
-                    // TODO
-                    unreachable;
-                },
+                error.InvalidIndex => unreachable,
             };
-            mixerResponseQueue.realtimeWrite(MixerResponse{ .sourceAdded = removedSource }) catch |err| switch (err) {
-                error.Overrun => {
-                    std.debug.print("Overrun on rtRemoveSource\n", .{});
-                },
-            };
+            mixerSendResponse(MixerResponse.sourceRemoved(request, removedSource));
         } else {
             // TODO error: source does not exist
         }
     }
-
-    /// Make a sound available for use by sources.
-    inline fn rtRegisterSound(s: Sound) void {
+    inline fn mixerRegisterSound(request: MixerRequest, s: Sound) void {
         sounds.add(s) catch |err| switch (err) {
             error.Overrun => {
-                // TODO error: too many sounds!
+                mixerSendResponse(MixerResponse.tooManySounds(request, s));
+                return;
             },
         };
+        mixerSendResponse(MixerResponse.soundRegistered(request, s));
     }
-
-    /// Remove all sources that are using a sound.
-    inline fn rtUnregisterSound(id: u64) void {
-        if (findSound(id)) |i| {
+    inline fn mixerUnregisterSound(request: MixerRequest, id: u64) void {
+        if (mixerFindSound(id)) |i| {
             const unregisteredSound = sounds.removeAt(i) catch |err| switch (err) {
                 error.InvalidIndex => unreachable,
             };
@@ -466,22 +521,39 @@ const Middleware = struct {
                     src += 1;
                 }
             }
-            mixerResponseQueue.realtimeWrite(MixerResponse{ .soundUnregistered = unregisteredSound }) catch |err| switch (err) {
-                error.Overrun => unreachable,
-            };
+            mixerSendResponse(MixerResponse.soundUnregistered(request, unregisteredSound));
         } else {
             // TODO error: sound does not exist
         }
     }
-
-    inline fn findSound(id: u64) ?usize {
+    inline fn mixerResumeSource(req: MixerRequest, id: u64) void {
+        _ = req;
+        if (mixerFindSource(id)) |i| {
+            sources.data[i].paused = false;
+        } else {
+            // TODO error: no such source
+        }
+    }
+    inline fn mixerPauseSource(req: MixerRequest, id: u64) void {
+        _ = req;
+        if (mixerFindSource(id)) |i| {
+            sources.data[i].paused = true;
+        } else {
+            // TODO error: no such source
+        }
+    }
+    inline fn mixerSendResponse(resp: MixerResponse) void {
+        responseQueue.realtimeWrite(resp) catch |err| switch (err) {
+            error.Overrun => unreachable,
+        };
+    }
+    inline fn mixerFindSound(id: u64) ?usize {
         for (0..sounds.len()) |i| {
             if (sounds.get(i).id == id) return i;
         }
         return null;
     }
-
-    inline fn findSource(id: u64) ?usize {
+    inline fn mixerFindSource(id: u64) ?usize {
         for (0..sources.len()) |i| {
             if (sources.get(i).id == id) return i;
         }
@@ -489,38 +561,38 @@ const Middleware = struct {
     }
 
     fn render(target: []f32) void {
-        {
-            // TODO replace read loop with single range; will perform many fewer atomic operations when many events exist
-            while (mixerNotificationQueue.realtimeRead()) |event| {
-                switch (event) {
-                    .playSound => |params| rtPlaySound(params),
-                    .removeSource => |id| rtRemoveSource(id),
-                    .registerSound => |s| rtRegisterSound(s),
-                    .unregisterSound => |s| rtUnregisterSound(s),
-                }
+        var startTimestamp: i128 = undefined;
+        if (DEBUG) startTimestamp = std.time.nanoTimestamp();
+
+        // process requests from other threads
+        while (requestQueue.realtimeRead()) |req| {
+            switch (req.payload) {
+                .playSound => |params| mixerPlaySound(req, params),
+                .removeSource => |id| mixerRemoveSource(req, id),
+                .registerSound => |s| mixerRegisterSound(req, s),
+                .unregisterSound => |s| mixerUnregisterSound(req, s),
+                .pauseSource => |id| mixerPauseSource(req, id),
+                .resumeSource => |id| mixerResumeSource(req, id),
             }
         }
-        {
-            // remove sources for completed sounds
-            var i: usize = 0;
-            while (i != sources.len()) {
-                if (sources.get(i).isComplete) {
-                    const source = sources.removeAt(i) catch |err| switch (err) {
-                        error.InvalidIndex => unreachable,
-                    };
-                    mixerResponseQueue.realtimeWrite(MixerResponse{ .sourceCompleted = source }) catch |err| switch (err) {
-                        error.Overrun => unreachable,
-                    };
-                } else {
-                    i += 1;
-                }
+        // remove completed sources
+        var i: usize = 0;
+        while (i != sources.len()) {
+            if (sources.get(i).isComplete) {
+                const source = sources.removeAt(i) catch |err| switch (err) {
+                    error.InvalidIndex => unreachable,
+                };
+                mixerSendResponse(MixerResponse.sourceCompleted(source));
+            } else {
+                i += 1;
             }
         }
+        // mix sources into output buffer
         for (0..target.len / CHANNELS) |t| {
             var mix: f32 = 0;
             var value = [_]f32{0.0};
-            for (0..sources.len()) |i| {
-                sources.data[i].render(&value);
+            for (0..sources.len()) |s| {
+                sources.data[s].render(&value);
                 mix += value[0];
             }
             if (mix > 1.0) mix = 1.0;
@@ -528,111 +600,30 @@ const Middleware = struct {
             target[t * 2 + 0] = mix;
             target[t * 2 + 1] = mix;
         }
+
+        if (DEBUG) {
+            processNs.store(@intCast(std.time.nanoTimestamp() - startTimestamp), .SeqCst);
+            targetNs.store(@intCast(target.len * 1_000_000_000 / RATE_HZ), .SeqCst);
+        }
     }
 };
-
-// RING BUFFERS
-
-// Single-producer, single-consumer, null on underrun, alert on overrun
-// Used to receive responses from the realtime mixer thread, e.g. sound is no longer in use & can be deallocated
-fn SpScRingFifo(comptime T: anytype, comptime N: comptime_int) type {
-    return struct {
-        read: Atomic(usize),
-        write: Atomic(usize),
-        data: [N]T = undefined,
-
-        fn init() @This() {
-            return .{
-                .read = Atomic(usize).init(0),
-                .write = Atomic(usize).init(0),
-            };
-        }
-
-        fn realtimeWrite(self: *@This(), obj: T) !void {
-            const r = self.read.load(.Monotonic);
-            const w = self.write.load(.Monotonic);
-            const nextW = (w + 1) % N;
-            if (nextW == r) return error.Overrun;
-            self.data[w] = obj;
-            self.write.store(nextW, .Release);
-        }
-
-        fn realtimeRead(self: *@This()) ?T {
-            const w = self.write.load(.Acquire);
-            const r = self.read.load(.Monotonic);
-            if (r == w) return null; // Underrun
-            const obj = self.data[r];
-            self.read.store((r + 1) % N, .Release);
-            return obj;
-        }
-    };
-}
-
-// Multiple-producer, single-consumer, null on underrun, alert on overrun
-// Used to send notifications to the realtime mixer thread
-fn MpScRingFifo(
-    comptime Obj: anytype,
-    comptime N: comptime_int,
-) type {
-    return struct {
-        read: Atomic(usize),
-        write: Atomic(usize),
-        insert: Atomic(usize),
-        data: [N]Obj = undefined,
-
-        fn init() @This() {
-            return .{
-                .read = Atomic(usize).init(0),
-                .write = Atomic(usize).init(0),
-                .insert = Atomic(usize).init(0),
-            };
-        }
-
-        /// Supports multiple, non-realtime producers.
-        fn spinWrite(self: *@This(), obj: Obj) !void {
-            var r: usize = undefined;
-            var w: usize = undefined;
-            var nextW: usize = undefined;
-            overrunCheck: while (true) {
-                r = self.read.load(.Monotonic);
-                w = self.write.load(.Monotonic);
-                nextW = (w + 1) % N;
-                if (self.write.compareAndSwap(w, nextW, .SeqCst, .Monotonic) == null) { // advance write head
-                    if (nextW == r) return error.Overrun;
-                    break :overrunCheck;
-                }
-            }
-            self.data[w] = obj;
-            while (self.insert.compareAndSwap(w, nextW, .SeqCst, .Monotonic) != null) {} // advance insert head
-        }
-
-        // Supports single, realtime consumer.
-        fn realtimeRead(self: *@This()) ?Obj {
-            const i = self.insert.load(.Monotonic);
-            const r = self.read.load(.SeqCst);
-            if (i == r) {
-                return null;
-            }
-            const obj = self.data[r];
-            const nextR = (r + 1) % N;
-            self.read.store(nextR, .SeqCst);
-            return obj;
-        }
-    };
-}
 
 // BACKENDS
 
 const AlsaBackend = struct {
-    const RATE_HZ: c_uint = 44100;
-    const SPACING_SEC: f64 = 1.0 / @as(f64, @floatFromInt(RATE_HZ));
-    const CHANNELS: c_uint = 2;
-    const BUF_FRAMES: c.snd_pcm_uframes_t = 4096;
+    // sound card sends interrupt to CPU after each period
+    // typically, the period size is half the buffer size, i.e. double buffering
+    // sound cards have their own constraints on valid values for the period size & buffer size
+    // latency is determined by the buffer size & sample rate: samples / samples/sec = sec
+
+    const RATE_HZ: c_uint = 44100; // TODO unify with Middleware's RATE_HZ
+    const CHANNELS: c_uint = 2; // TODO unify with MIDDLEWARE's CHANNELS
+    const BUF_FRAMES: c.snd_pcm_uframes_t = 4096; // TODO experiment with larger & smaller buffers + make sure period sizes are at most BUF_FRAMES
     const MAX_SOUNDS: usize = 4;
     const MAX_VOICES: usize = 4;
 
     var mixerThread: std.Thread = undefined;
-    var shutdownRequested = false;
+    var shutdownRequested = Atomic(bool).init(false);
 
     var player: *c.snd_pcm_t = undefined;
     var avail: c.snd_pcm_sframes_t = undefined;
@@ -646,7 +637,7 @@ const AlsaBackend = struct {
         var dir: c_int = 0;
         var err: c_int = 0;
 
-        // TODO handle error codes
+        // TODO handle error codes; fallback to a NullBackend if initialization fails
         _ = c.snd_pcm_open(&player, "default", .playback, .block);
 
         _ = c.snd_pcm_hw_params_malloc(&hw);
@@ -654,12 +645,12 @@ const AlsaBackend = struct {
         _ = c.snd_pcm_hw_params_set_access(player, hw, .rw_interleaved);
         err = c.snd_pcm_hw_params_set_format(player, hw, .float_le);
         if (err != 0) {
-            std.debug.print("unsupported sample format: {s}\n", .{c.snd_strerror(err)});
+            warn("unsupported sample format: {s}\n", .{c.snd_strerror(err)});
         }
         // _ = c.snd_pcm_hw_params_set_rate_resample(player, hw, 0); // TODO disable software resampling; implement my own? or use only sounds with the target rate.
         _ = c.snd_pcm_hw_params_set_rate_near(player, hw, &rate, &dir);
         if (rate != RATE_HZ) {
-            std.debug.print("Rate {d} not supported, use {d} instead\n", .{ RATE_HZ, rate });
+            warn("Rate {d} not supported, use {d} instead\n", .{ RATE_HZ, rate });
         }
         _ = c.snd_pcm_hw_params_set_channels(player, hw, CHANNELS);
         _ = c.snd_pcm_hw_params(player, hw);
@@ -679,27 +670,27 @@ const AlsaBackend = struct {
     }
 
     fn shutdown() void {
-        shutdownRequested = true;
+        shutdownRequested.store(true, .Monotonic);
         mixerThread.join();
         _ = c.snd_pcm_close(player);
     }
 
     fn audio_thread_worker() void {
         var err: c_int = undefined;
-        while (!shutdownRequested) { // TODO cheating? is this atomically updated?
+        while (!shutdownRequested.load(.Monotonic)) {
             err = c.snd_pcm_wait(player, 1000);
             if (err < 0) {
                 err = c.snd_pcm_recover(player, err, 0);
                 if (err < 0) {
-                    std.debug.print("Failed to recover from failed wait: {s}\n", .{c.snd_strerror(err)});
+                    warn("Failed to recover from failed wait: {s}\n", .{c.snd_strerror(err)});
                     break;
                 } else {
-                    std.debug.print("Recovered from wait failure\n", .{});
+                    warn("Recovered from wait failure\n", .{});
                 }
             }
             avail = c.snd_pcm_avail_update(player);
             if (avail < 0) {
-                std.debug.print("avail_update: {s}\n", .{c.snd_strerror(@intCast(avail))});
+                warn("avail_update: {s}\n", .{c.snd_strerror(@intCast(avail))});
                 break;
             }
             avail = @min(avail, BUF_FRAMES);
@@ -708,18 +699,19 @@ const AlsaBackend = struct {
             if (err < 0) {
                 err = c.snd_pcm_recover(player, @intCast(err), 0);
                 if (err < 0) {
-                    std.debug.print("failed to recover from writei: {s}\n", .{c.snd_strerror(@intCast(err))});
+                    warn("failed to recover from writei: {s}\n", .{c.snd_strerror(@intCast(err))});
                 }
             }
             if (err != avail) {
-                std.debug.print("render callback failed!\n", .{});
+                warn("render callback failed!\n", .{});
                 break;
             }
         }
     }
 };
 
-fn Swapback(comptime T: anytype, comptime N: comptime_int) type {
+// Swapback array is used to manage sounds & sources
+pub fn Swapback(comptime T: anytype, comptime N: comptime_int) type {
     return struct {
         count: usize,
         data: [N]T,
@@ -753,13 +745,119 @@ fn Swapback(comptime T: anytype, comptime N: comptime_int) type {
             self.data[self.count] = obj;
             self.count += 1;
         }
+    };
+}
 
-        fn exportWhen(comptime condition: bool, comptime functions: type) type {
-            return if (condition) functions else struct {};
+// RING BUFFERS
+
+// Single-producer, single-consumer, null on underrun, alert on overrun
+// Used to receive responses from the realtime mixer thread, e.g. sound is no longer in use & can be deallocated
+pub fn SpScRingFifo(comptime T: anytype, comptime N: comptime_int) type {
+    return struct {
+        read: Atomic(usize),
+        write: Atomic(usize),
+        data: [N]T = undefined,
+
+        pub fn init() @This() {
+            return .{
+                .read = Atomic(usize).init(0),
+                .write = Atomic(usize).init(0),
+            };
         }
 
-        pub usingnamespace exportWhen(std.meta.trait.isNumber(T), struct {
-            // TODO export *ById fns when type has id member
-        });
+        pub fn realtimeWrite(self: *@This(), obj: T) !void {
+            const r = self.read.load(.SeqCst);
+            const w = self.write.load(.SeqCst);
+            const nextW = (w + 1) % N;
+            if (nextW == r) return error.Overrun;
+            self.data[w] = obj;
+            self.write.store(nextW, .SeqCst);
+        }
+
+        pub fn realtimeRead(self: *@This()) ?T {
+            const w = self.write.load(.SeqCst);
+            const r = self.read.load(.SeqCst);
+            if (r == w) return null; // Underrun
+            const obj = self.data[r];
+            self.read.store((r + 1) % N, .SeqCst);
+            return obj;
+        }
     };
+}
+
+// Multiple-producer, single-consumer, null on underrun, alert on overrun
+// Used to send notifications to the realtime mixer thread
+pub fn MpScRingFifo(
+    comptime Obj: anytype,
+    comptime N: comptime_int,
+) type {
+    return struct {
+        read: Atomic(usize),
+        write: Atomic(usize),
+        insert: Atomic(usize),
+        data: [N]Obj = undefined,
+
+        pub fn init() @This() {
+            return .{
+                .read = Atomic(usize).init(0),
+                .write = Atomic(usize).init(0),
+                .insert = Atomic(usize).init(0),
+            };
+        }
+
+        /// Supports multiple, non-realtime producers.
+        pub fn spinWrite(self: *@This(), obj: Obj) !void {
+            var r: usize = undefined;
+            var w: usize = undefined;
+            var nextW: usize = undefined;
+            overrunCheck: while (true) {
+                r = self.read.load(.SeqCst);
+                w = self.write.load(.SeqCst);
+                nextW = (w + 1) % N;
+                if (self.write.compareAndSwap(w, nextW, .SeqCst, .Monotonic) == null) { // advance write head
+                    if (nextW == r) return error.Overrun;
+                    break :overrunCheck;
+                }
+            }
+            self.data[w] = obj;
+            while (self.insert.compareAndSwap(w, nextW, .SeqCst, .Monotonic) != null) {} // advance insert head
+        }
+
+        // Supports single, realtime consumer.
+        pub fn realtimeRead(self: *@This()) ?Obj {
+            const i = self.insert.load(.SeqCst);
+            const r = self.read.load(.SeqCst);
+            if (i == r) {
+                return null;
+            }
+            const obj = self.data[r];
+            const nextR = (r + 1) % N;
+            self.read.store(nextR, .SeqCst);
+            return obj;
+        }
+    };
+}
+
+fn parseInt(idStr: []const u8) ?u64 {
+    const id = std.fmt.parseInt(u64, idStr, 10) catch |err| switch (err) {
+        error.Overflow => {
+            std.debug.print("Input too large: '{s}'\n", .{idStr});
+            return null;
+        },
+        error.InvalidCharacter => {
+            std.debug.print("Not an integer: '{s}'\n", .{idStr});
+            return null;
+        },
+    };
+    return id;
+}
+
+inline fn debug(comptime fmt: []const u8, args: anytype) void {
+    if (DEBUG) std.debug.print("[DEBUG] " ++ fmt, args);
+}
+inline fn warn(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("[WARN] " ++ fmt, args);
+}
+inline fn info(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt, args);
 }
