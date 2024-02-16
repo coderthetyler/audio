@@ -13,8 +13,6 @@ const DEBUG = true;
 // - "Atomic Weapons: The C++ Memory Model and Modern Hardware", Herb Sutter, C++ and Beyond 2012
 
 pub fn main() !void {
-    // TODO try to recover from response queue overrun
-    // TODO master gain control
     // TODO per-source gain control
     // TODO macos backend
     // TODO DSP effects on sources
@@ -95,6 +93,10 @@ pub fn main() !void {
         } else if (line.len >= 7 + 1 and std.mem.eql(u8, line[0..7], "unpause")) {
             if (parseInt(line[7 + 1 ..])) |id| {
                 Middleware.requestResumeSource(id);
+            }
+        } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "gain")) {
+            if (parseFloat(line[4 + 1 ..])) |level| {
+                Middleware.globalGain.set(level);
             }
         } else {
             std.debug.print("Unknown cmd: {s}\n", .{line});
@@ -379,6 +381,7 @@ const Middleware = struct {
     var sounds: Swapback(Sound, MAX_SOUNDS) = undefined;
 
     // Shared by mixer & audio thread
+    var globalGain: GainControl = undefined;
     var requestQueue: MpScRingFifo(MixerRequest, MAX_EVENTS) = undefined;
     var responseQueue: SpScRingFifo(MixerResponse, MAX_EVENTS) = undefined;
     var isResponseQueueInOverrun: Atomic(bool) = undefined;
@@ -394,6 +397,7 @@ const Middleware = struct {
         requestQueue = MpScRingFifo(MixerRequest, MAX_EVENTS).init();
         responseQueue = SpScRingFifo(MixerResponse, MAX_EVENTS).init();
         isResponseQueueInOverrun = Atomic(bool).init(false);
+        globalGain = GainControl.init();
     }
 
     /// Not safe to call this until mixer thread has joined the main thread
@@ -611,6 +615,7 @@ const Middleware = struct {
                 sources.data[s].render(&value);
                 mix += value[0];
             }
+            mix *= globalGain.next();
             if (mix > 1.0) mix = 1.0;
             if (mix < -1.0) mix = -1.0;
             target[t * 2 + 0] = mix;
@@ -723,6 +728,25 @@ const AlsaBackend = struct {
                 break;
             }
         }
+    }
+};
+
+// Gain control with transition ramp to avoid clicks
+pub const GainControl = struct {
+    level: Atomic(f32),
+
+    pub fn init() @This() {
+        return .{
+            .level = Atomic(f32).init(1.0),
+        };
+    }
+
+    pub fn set(self: *@This(), level: f32) void {
+        self.level.store(level, .SeqCst);
+    }
+
+    pub inline fn next(self: *@This()) f32 {
+        return self.level.load(.SeqCst);
     }
 };
 
@@ -854,6 +878,15 @@ pub fn MpScRingFifo(
     };
 }
 
+fn parseFloat(str: []const u8) ?f32 {
+    const value = std.fmt.parseFloat(f32, str) catch |err| switch (err) {
+        error.InvalidCharacter => {
+            std.debug.print("Not a float: '{s}'\n", .{str});
+            return null;
+        },
+    };
+    return value;
+}
 fn parseInt(idStr: []const u8) ?u64 {
     const id = std.fmt.parseInt(u64, idStr, 10) catch |err| switch (err) {
         error.Overflow => {
