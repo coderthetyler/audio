@@ -18,19 +18,20 @@ const DEBUG = true;
 // 3. AT uses MT responses to update source states, free resources, etc
 
 pub fn main() !void {
-    // TODO experiment with array of sources, to preserve stable indices; perhaps that could outperform linear for each source/sound request?
-    // TODO can i get away with a single queue shared by both audio & mixer threads?
-    // TODO gradual global gain control
     // TODO macos backend
+    // TODO standardize audio file format: 48k24b wav
+    // TODO can i get away with a single queue shared by both audio & mixer threads?
     // TODO DSP effects on sources
+    // TODO gradual global gain control
     // TODO audio engine state machine
-    // TODO benchmark fifos
     // TODO less awkward Sound.render() API
     // TODO set ALSA backend thread priority
-    // TODO pin event queue pages
+    // TODO pin pages being used by mixer?
     // TODO budget memory allocations for sound; actually have a counter for all audio memory usage
     // TODO enumerate & select playback device
 
+    debug("@sizeOf(Sound) = {d}\n", .{@sizeOf(Sound)});
+    debug("@sizeOf(Source) = {d}\n", .{@sizeOf(Source)});
     debug("@sizeOf(MessageFromAudioThread) = {d}\n", .{@sizeOf(MessageFromAudioThread)});
     debug("@sizeOf(MessageFromMixerThread) = {d}\n", .{@sizeOf(MessageFromMixerThread)});
     debug("@sizeOf(Middleware.mixerThreadInbox) = {d}\n", .{@sizeOf(@TypeOf(Middleware.mixerThreadInbox))});
@@ -333,13 +334,6 @@ const MessageFromMixerThread = struct {
         sourceCompleted: Source,
     },
 };
-
-// data:
-// - swapback array of playing sources
-// - swapback array of available sounds
-// - global gain control
-// - request fifo
-// - response fifo
 
 const Middleware = struct {
     const RATE_HZ: usize = 44100;
