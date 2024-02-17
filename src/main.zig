@@ -18,7 +18,6 @@ const DEBUG = true;
 // 3. AT uses MT responses to update source states, free resources, etc
 
 pub fn main() !void {
-    // TODO publish responses from MT atomically (to avoid reading torn source states)
     // TODO record timing stats for any MT frame that processes requests (should take longer)
     // TODO experiment with array of sources, to preserve stable indices; perhaps that could outperform linear for each source/sound request?
     // TODO per-source gain control
@@ -402,8 +401,8 @@ const Middleware = struct {
 
     // Shared by mixer & audio thread
     var globalGain: GainControl = undefined;
-    var requestQueue: RequestQueue(MixerRequest, MAX_EVENTS) = undefined;
-    var responseQueue: ResponseQueue(MixerResponse, MAX_EVENTS) = undefined;
+    var requestQueue: Fifo(MixerRequest, MAX_EVENTS) = undefined;
+    var responseQueue: Fifo(MixerResponse, MAX_EVENTS) = undefined;
     var isResponseQueueInOverrun: Atomic(bool) = undefined;
 
     // Performance statistics (DEBUG ONLY)
@@ -414,8 +413,8 @@ const Middleware = struct {
         wavAllocator = allocator;
         sources = Swapback(Source, MAX_SOURCES).init();
         sounds = Swapback(Sound, MAX_SOUNDS).init();
-        requestQueue = RequestQueue(MixerRequest, MAX_EVENTS).init();
-        responseQueue = ResponseQueue(MixerResponse, MAX_EVENTS).init();
+        requestQueue = Fifo(MixerRequest, MAX_EVENTS).init();
+        responseQueue = Fifo(MixerResponse, MAX_EVENTS).init();
         isResponseQueueInOverrun = Atomic(bool).init(false);
         globalGain = GainControl.init();
     }
@@ -618,6 +617,8 @@ const Middleware = struct {
                 .resumeSource => |id| mixerResumeSource(req, id),
             }
         }
+        responseQueue.publishToReader();
+
         // remove completed sources
         var i: usize = 0;
         while (i != sources.len()) {
@@ -813,44 +814,9 @@ pub fn Swapback(comptime T: anytype, comptime N: comptime_int) type {
 
 // RING BUFFERS
 
-// Single-producer, single-consumer, null on underrun, alert on overrun
-// Used to receive responses from the realtime mixer thread, e.g. sound is no longer in use & can be deallocated
-pub fn ResponseQueue(comptime T: anytype, comptime N: comptime_int) type {
-    return struct {
-        read: Atomic(usize),
-        write: Atomic(usize),
-        data: [N]T = undefined,
-
-        pub fn init() @This() {
-            return .{
-                .read = Atomic(usize).init(0),
-                .write = Atomic(usize).init(0),
-            };
-        }
-
-        pub fn addLast(self: *@This(), obj: T) !void {
-            const r = self.read.load(.SeqCst);
-            const w = self.write.load(.SeqCst);
-            const nextW = (w + 1) % N;
-            if (nextW == r) return error.Overrun;
-            self.data[w] = obj;
-            self.write.store(nextW, .SeqCst);
-        }
-
-        pub fn removeFirst(self: *@This()) ?T {
-            const w = self.write.load(.SeqCst);
-            const r = self.read.load(.SeqCst);
-            if (r == w) return null; // Underrun
-            const obj = self.data[r];
-            self.read.store((r + 1) % N, .SeqCst);
-            return obj;
-        }
-    };
-}
-
 // Multiple-producer, single-consumer, null on underrun, alert on overrun
 // Used to send notifications to the realtime mixer thread
-pub fn RequestQueue(
+pub fn Fifo(
     comptime Obj: anytype,
     comptime N: comptime_int,
 ) type {
