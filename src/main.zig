@@ -19,7 +19,7 @@ const DEBUG = true;
 
 pub fn main() !void {
     // TODO experiment with array of sources, to preserve stable indices; perhaps that could outperform linear for each source/sound request?
-    // TODO per-source gain control
+    // TODO can i get away with a single queue shared by both audio & mixer threads?
     // TODO gradual global gain control
     // TODO macos backend
     // TODO DSP effects on sources
@@ -65,12 +65,7 @@ pub fn main() !void {
             }
         } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "loop")) {
             if (parseInt(line[4 + 1 ..])) |id| {
-                _ = Middleware.requestPlaySound(SourceParams{
-                    .soundId = id,
-                    .startTime = 0,
-                    .loop = true,
-                    .paused = false,
-                });
+                _ = Middleware.requestPlaySound(PlaySoundParams{ .soundId = id, .loop = true });
             }
         } else if (line.len >= 3 + 1 and std.mem.eql(u8, line[0..3], "wav")) {
             const soundPath = line[3 + 1 ..];
@@ -85,12 +80,7 @@ pub fn main() !void {
             }
         } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "play")) {
             if (parseInt(line[4 + 1 ..])) |id| {
-                _ = Middleware.requestPlaySound(SourceParams{
-                    .soundId = id,
-                    .startTime = 0,
-                    .loop = false,
-                    .paused = false,
-                });
+                _ = Middleware.requestPlaySound(PlaySoundParams{ .soundId = id });
             }
         } else if (line.len >= 3 + 1 and std.mem.eql(u8, line[0..3], "end")) {
             if (parseInt(line[3 + 1 ..])) |id| {
@@ -98,35 +88,57 @@ pub fn main() !void {
             }
         } else if (line.len >= 5 + 1 and std.mem.eql(u8, line[0..5], "pause")) {
             if (parseInt(line[5 + 1 ..])) |id| {
-                Middleware.requestPauseSource(id);
+                Middleware.requestUpdateSource(.{ .id = id, .pause = true });
             }
         } else if (line.len >= 7 + 1 and std.mem.eql(u8, line[0..7], "unpause")) {
             if (parseInt(line[7 + 1 ..])) |id| {
-                Middleware.requestResumeSource(id);
+                Middleware.requestUpdateSource(.{ .id = id, .pause = false });
             }
         } else if (line.len >= 4 + 1 and std.mem.eql(u8, line[0..4], "gain")) {
             if (parseFloat(line[4 + 1 ..])) |level| {
                 Middleware.globalGain.set(level);
             }
+        } else if (line.len >= 5 + 1 and std.mem.eql(u8, line[0..5], "sgain")) {
+            const hasSpace = blk: {
+                for (5 + 1..line.len - 1) |i| {
+                    if (line[i] == ' ') break :blk i;
+                }
+                break :blk null;
+            };
+            if (hasSpace) |sp| {
+                if (parseInt(line[5 + 1 .. sp])) |id| {
+                    if (parseFloat(line[sp + 1 ..])) |gain| {
+                        Middleware.requestUpdateSource(.{ .id = id, .level = gain });
+                    }
+                }
+            }
         } else {
             std.debug.print("Unknown cmd: {s}\n", .{line});
         }
-        Middleware.processEvents();
+        Middleware.processMessages();
         std.debug.print("> ", .{});
     }
     std.debug.print("Goodbye\n", .{});
 }
 
-const SourceParams = struct {
+const UpdateSourceParams = struct {
+    id: u64,
+    loop: ?bool = null,
+    pause: ?bool = null,
+    level: ?f32 = null,
+};
+const PlaySoundParams = struct {
     id: u64 = 0,
     soundId: u64,
-    startTime: usize,
-    loop: bool,
-    paused: bool,
+    level: f32 = 1.0,
+    startTime: usize = 0,
+    loop: bool = false,
+    paused: bool = false,
 };
 const Source = struct {
     id: u64,
     sound: *Sound,
+    level: f32,
     time: usize,
     loop: bool,
     paused: bool,
@@ -138,7 +150,7 @@ const Source = struct {
             @memset(target, 0.0);
             return;
         }
-        const framesWritten = self.sound.read(self.time, target, self.loop);
+        const framesWritten = self.sound.read(self.time, target, self.loop, self.level);
         if (framesWritten != target.len) {
             self.isComplete = true;
         }
@@ -170,10 +182,10 @@ const Sound = struct {
             .data = .{ .sine = .{ .rate = rate, .channels = channels, .hz = hz } },
         };
     }
-    fn read(self: @This(), from: usize, target: []f32, loop: bool) usize {
+    fn read(self: @This(), from: usize, target: []f32, loop: bool, level: f32) usize {
         return switch (self.data) {
-            .wav => |wav| wav.read(from, target, loop),
-            .sine => |sin| sin.read(from, target),
+            .wav => |wav| wav.read(from, target, loop, level),
+            .sine => |sin| sin.read(from, target, level),
         };
     }
     fn free(self: @This()) void {
@@ -188,12 +200,13 @@ const Sine = struct {
     channels: u32,
     hz: u32,
 
-    fn read(self: @This(), from: usize, target: []f32) usize {
+    fn read(self: @This(), from: usize, target: []f32, level: f32) usize {
         const SPACING_SEC = 1.0 / @as(f64, @floatFromInt(self.rate));
         var elapsed_time = @as(f64, @floatFromInt(from)) * SPACING_SEC;
         const FRAMES_TO_WRITE = target.len / self.channels;
         for (0..FRAMES_TO_WRITE) |i| {
             target[i * 2] = @floatCast(@sin(elapsed_time * 2 * std.math.pi * @as(f64, @floatFromInt(self.hz))));
+            target[i * 2] *= level;
             elapsed_time += SPACING_SEC;
         }
         return target.len;
@@ -251,7 +264,7 @@ pub const Wav = struct {
         };
     }
 
-    fn read(self: @This(), from: usize, target: []f32, loop: bool) usize {
+    fn read(self: @This(), from: usize, target: []f32, loop: bool, level: f32) usize {
         if (!loop and from >= self.samples.len) return 0;
         const fromMod = from % self.samples.len;
         const remainingFrames = self.samples.len - fromMod;
@@ -264,6 +277,9 @@ pub const Wav = struct {
             } else {
                 @memset(target[framesToWrite..], 0.0);
             }
+        }
+        for (0..framesToWrite) |i| {
+            target[i] *= level;
         }
         // TODO generalize to support arbitrary channel counts & not just stereo
         // TODO must be that sample rate matches playback rate
@@ -284,18 +300,16 @@ const MessageFromAudioThreadType = enum {
     unregisterSound,
     playSound,
     removeSource,
-    pauseSource,
-    resumeSource,
+    updateSource,
 };
 const MessageFromAudioThread = struct {
     id: usize,
     payload: union(MessageFromAudioThreadType) {
         registerSound: Sound,
         unregisterSound: u64,
-        playSound: SourceParams,
+        playSound: PlaySoundParams,
         removeSource: u64,
-        pauseSource: u64,
-        resumeSource: u64,
+        updateSource: UpdateSourceParams,
     },
 };
 const MessageFromMixerThreadType = enum {
@@ -380,7 +394,7 @@ const Middleware = struct {
 
     /// Not safe to call this until mixer thread has joined the main thread
     fn shutdown() void {
-        processEvents(); // take ownership of any straggling in-flight events
+        processMessages(); // take ownership of any straggling in-flight events
         for (0..sounds.len()) |i| {
             sounds.get(i).free();
         }
@@ -401,7 +415,10 @@ const Middleware = struct {
     fn requestUnregisterSound(id: u64) void {
         sendToMixerThread(.{ .unregisterSound = id });
     }
-    fn requestPlaySound(params: SourceParams) u64 {
+    fn requestSourceUpdate(params: UpdateSourceParams) void {
+        sendToMixerThread(.{ .updateSource = params });
+    }
+    fn requestPlaySound(params: PlaySoundParams) u64 {
         var modifiedParams = params;
         modifiedParams.id = sourceIdGen.fetchAdd(1, .Monotonic);
         sendToMixerThread(.{ .playSound = params });
@@ -410,11 +427,8 @@ const Middleware = struct {
     fn requestRemoveSource(id: u64) void {
         sendToMixerThread(.{ .removeSource = id });
     }
-    fn requestPauseSource(id: u64) void {
-        sendToMixerThread(.{ .pauseSource = id });
-    }
-    fn requestResumeSource(id: u64) void {
-        sendToMixerThread(.{ .resumeSource = id });
+    fn requestUpdateSource(params: UpdateSourceParams) void {
+        sendToMixerThread(.{ .updateSource = params });
     }
     inline fn sendToMixerThread(payload: anytype) void {
         const req = MessageFromAudioThread{
@@ -429,10 +443,10 @@ const Middleware = struct {
     }
 
     /// Called from audio thread to process events from mixer thread
-    fn processEvents() void {
+    fn processMessages() void {
         _ = mixerThreadInbox.releaseMessages();
         if (isAudioThreadInboxFull.load(.Monotonic)) {
-            warn("processEvents() too slow or mixer sending too many messages, possibly leaking memory or corrupting playback state", .{});
+            warn("processMessages() too slow or mixer sending too many messages, possibly leaking memory or corrupting playback state", .{});
             isAudioThreadInboxFull.store(false, .Monotonic);
         }
         if (DEBUG) {
@@ -471,12 +485,13 @@ const Middleware = struct {
     }
 
     // MIXER -> AUDIO THREAD
-    inline fn mtPlaySound(request: MessageFromAudioThread, params: SourceParams) void {
+    inline fn mtPlaySound(request: MessageFromAudioThread, params: PlaySoundParams) void {
         if (mtFindSound(params.soundId)) |i| {
             const sound = &sounds.data[i];
             const source = Source{
                 .id = params.id,
                 .sound = sound,
+                .level = params.level,
                 .time = params.startTime,
                 .loop = params.loop,
                 .paused = params.paused,
@@ -533,17 +548,13 @@ const Middleware = struct {
             // TODO error: sound does not exist
         }
     }
-    inline fn mtResumeSource(_: MessageFromAudioThread, id: u64) void {
-        if (mtFindSource(id)) |i| {
-            sources.data[i].paused = false;
-        } else {
-            // TODO error: no such source
-        }
-    }
-    inline fn mtPauseSource(req: MessageFromAudioThread, id: u64) void {
+    inline fn mtUpdateSource(req: MessageFromAudioThread, params: UpdateSourceParams) void {
         _ = req;
-        if (mtFindSource(id)) |i| {
-            sources.data[i].paused = true;
+        if (mtFindSource(params.id)) |i| {
+            const source = &sources.data[i];
+            if (params.pause) |paused| source.paused = paused;
+            if (params.loop) |loop| source.loop = loop;
+            if (params.level) |level| source.level = level;
         } else {
             // TODO error: no such source
         }
@@ -581,8 +592,7 @@ const Middleware = struct {
                 .removeSource => |id| mtRemoveSource(req, id),
                 .registerSound => |s| mtRegisterSound(req, s),
                 .unregisterSound => |s| mtUnregisterSound(req, s),
-                .pauseSource => |id| mtPauseSource(req, id),
-                .resumeSource => |id| mtResumeSource(req, id),
+                .updateSource => |params| mtUpdateSource(req, params),
             }
         }
         // remove completed sources
