@@ -18,7 +18,7 @@ const DEBUG = true;
 // 3. AT uses MT responses to update source states, free resources, etc
 
 pub fn main() !void {
-    // TODO standardize audio file format: 48k24b wav
+    // TODO spatial audio
     // TODO can i get away with a single queue shared by both audio & mixer threads?
     // TODO DSP effects on sources
     // TODO gradual global gain control
@@ -28,6 +28,7 @@ pub fn main() !void {
     // TODO pin pages being used by mixer?
     // TODO budget memory allocations for sound; actually have a counter for all audio memory usage
     // TODO enumerate & select playback device
+    // TODO fixed point mixing?
 
     debug("@sizeOf(Sound) = {d}\n", .{@sizeOf(Sound)});
     debug("@sizeOf(Source) = {d}\n", .{@sizeOf(Source)});
@@ -299,16 +300,9 @@ pub const Wav = struct {
     }
 };
 
-const MessageFromAudioThreadType = enum {
-    registerSound,
-    unregisterSound,
-    playSound,
-    removeSource,
-    updateSource,
-};
 const MessageFromAudioThread = struct {
     id: usize,
-    payload: union(MessageFromAudioThreadType) {
+    payload: union(enum) {
         registerSound: Sound,
         unregisterSound: u64,
         playSound: PlaySoundParams,
@@ -316,18 +310,9 @@ const MessageFromAudioThread = struct {
         updateSource: UpdateSourceParams,
     },
 };
-const MessageFromMixerThreadType = enum {
-    tooManySounds,
-    tooManySources,
-    soundRegistered,
-    soundUnregistered,
-    sourceRemoved,
-    sourceAdded,
-    sourceCompleted,
-};
 const MessageFromMixerThread = struct {
     id: usize,
-    payload: union(MessageFromMixerThreadType) {
+    payload: union(enum) {
         tooManySounds: Sound,
         tooManySources: Source,
         soundRegistered: Sound,
