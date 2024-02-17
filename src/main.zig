@@ -13,7 +13,9 @@ const DEBUG = true;
 // - "Atomic Weapons: The C++ Memory Model and Modern Hardware", Herb Sutter, C++ and Beyond 2012
 
 pub fn main() !void {
+    // TODO try array of sources, to preserve stable indices; experiment with mailbox-style source parameters
     // TODO per-source gain control
+    // TODO gradual global gain control
     // TODO macos backend
     // TODO DSP effects on sources
     // TODO audio engine state machine
@@ -365,6 +367,13 @@ const MixerResponse = struct {
         return .{ .id = MixerRequest.idGen.fetchAdd(1, .Monotonic), .payload = .{ .sourceCompleted = source } };
     }
 };
+
+// data:
+// - swapback array of playing sources
+// - swapback array of available sounds
+// - global gain control
+// - request fifo
+// - response fifo
 
 const Middleware = struct {
     const RATE_HZ: usize = 44100;
