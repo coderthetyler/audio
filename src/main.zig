@@ -18,7 +18,6 @@ const DEBUG = true;
 // 3. AT uses MT responses to update source states, free resources, etc
 
 pub fn main() !void {
-    // TODO record timing stats for any MT frame that processes requests (should take longer)
     // TODO experiment with array of sources, to preserve stable indices; perhaps that could outperform linear for each source/sound request?
     // TODO per-source gain control
     // TODO gradual global gain control
@@ -112,7 +111,6 @@ pub fn main() !void {
         } else {
             std.debug.print("Unknown cmd: {s}\n", .{line});
         }
-        Middleware.publishRequests();
         Middleware.processEvents();
         std.debug.print("> ", .{});
     }
@@ -406,8 +404,10 @@ const Middleware = struct {
     var isResponseQueueInOverrun: Atomic(bool) = undefined;
 
     // Performance statistics (DEBUG ONLY)
-    var targetNs = Atomic(i64).init(0);
-    var processNs = Atomic(i64).init(0);
+    var lastTargetNs = Atomic(i64).init(0);
+    var lastProcessNs = Atomic(i64).init(0);
+    var lastPublishTargetNs = Atomic(i64).init(0);
+    var lastPublishProcessNs = Atomic(i64).init(0);
 
     fn init(allocator: std.mem.Allocator) void {
         wavAllocator = allocator;
@@ -429,36 +429,45 @@ const Middleware = struct {
 
     /// Called from audio thread to process events from mixer thread
     fn processEvents() void {
+        _ = requestQueue.publishToReader();
         if (isResponseQueueInOverrun.load(.Monotonic)) {
             warn("processEvents() too slow, possibly leaking memory or corrupting playback state", .{});
             isResponseQueueInOverrun.store(false, .Monotonic);
         }
-        debug("targetNs = {d}, processNs = {d}\n", .{ targetNs.load(.SeqCst), processNs.load(.SeqCst) });
+        { // TODO encapsulate render frame statistics & make them properly atomic
+            const targetNs = lastTargetNs.load(.SeqCst);
+            const processNs = lastProcessNs.load(.SeqCst);
+            const publishTargetNs = lastPublishTargetNs.load(.SeqCst);
+            const publishProcessNs = lastPublishProcessNs.load(.SeqCst);
+            const publishRatio = @as(f64, @floatFromInt(publishTargetNs)) / @as(f64, @floatFromInt(publishProcessNs));
+            const lastRatio = @as(f64, @floatFromInt(targetNs)) / @as(f64, @floatFromInt(processNs));
+            debug("last = ({d} / {d}, {d:.1}), publish = ({d}/ {d}, {d:.1})\n", .{ processNs, targetNs, lastRatio, publishProcessNs, publishTargetNs, publishRatio });
+        }
         while (responseQueue.removeFirst()) |resp| {
             debug("resp {d}- {any}\n", .{ resp.id, resp.payload });
             switch (resp.payload) {
                 .soundRegistered => |sound| {
-                    std.debug.print("Sound registered: {d}\n", .{sound.id});
+                    info("! Sound registered: {d}\n", .{sound.id});
                 },
                 .soundUnregistered => |sound| {
                     sound.free();
-                    std.debug.print("Sound freed: {d}\n", .{sound.id});
+                    info("! Sound freed: {d}\n", .{sound.id});
                 },
                 .sourceRemoved => |source| {
-                    std.debug.print("Source removed: {d}\n", .{source.id});
+                    info("! Source removed: {d}\n", .{source.id});
                 },
                 .sourceAdded => |source| {
-                    std.debug.print("Source added: {d}\n", .{source.id});
+                    info("! Source added: {d}\n", .{source.id});
                 },
                 .sourceCompleted => |source| {
-                    std.debug.print("Source completed: {d}\n", .{source.id});
+                    info("! Source completed: {d}\n", .{source.id});
                 },
                 .tooManySounds => |sound| {
-                    std.debug.print("Too many sounds, unloading {d}\n", .{sound.id});
+                    info("! Too many sounds, unloading {d}\n", .{sound.id});
                     sound.free();
                 },
                 .tooManySources => |source| {
-                    std.debug.print("Too many sources, not playing {d}\n", .{source.id});
+                    info("! Too many sources, not playing {d}\n", .{source.id});
                 },
             }
         }
@@ -499,9 +508,7 @@ const Middleware = struct {
             },
         };
     }
-    inline fn publishRequests() void {
-        requestQueue.publishToReader();
-    }
+    inline fn publishRequests() void {}
 
     // Called from the mixer thread to process requests from the audio thread
     inline fn mixerPlaySound(request: MixerRequest, params: SourceParams) void {
@@ -617,7 +624,7 @@ const Middleware = struct {
                 .resumeSource => |id| mixerResumeSource(req, id),
             }
         }
-        responseQueue.publishToReader();
+        const didPublish = responseQueue.publishToReader();
 
         // remove completed sources
         var i: usize = 0;
@@ -647,8 +654,14 @@ const Middleware = struct {
         }
 
         if (DEBUG) {
-            processNs.store(@intCast(std.time.nanoTimestamp() - startTimestamp), .SeqCst);
-            targetNs.store(@intCast(target.len * 1_000_000_000 / RATE_HZ), .SeqCst);
+            const processNs: i64 = @intCast(std.time.nanoTimestamp() - startTimestamp);
+            const targetNs: i64 = @intCast(target.len * 1_000_000_000 / RATE_HZ);
+            lastProcessNs.store(processNs, .SeqCst);
+            lastTargetNs.store(targetNs, .SeqCst);
+            if (didPublish) {
+                lastPublishProcessNs.store(processNs, .SeqCst);
+                lastPublishTargetNs.store(targetNs, .SeqCst);
+            }
         }
     }
 };
@@ -842,8 +855,10 @@ pub fn Fifo(
             self.data[self.write] = obj;
             self.write = nextW;
         }
-        pub fn publishToReader(self: *@This()) void {
+        pub fn publishToReader(self: *@This()) bool {
+            const didPublish = self.publish.load(.SeqCst) != self.write;
             self.publish.store(self.write, .SeqCst);
+            return didPublish;
         }
 
         // Called from realtime mixer thread; must not block
