@@ -12,8 +12,15 @@ const DEBUG = true;
 // - "Real time 101", David Rowland & Fabian Renn Giles, Meeting C++ 2019
 // - "Atomic Weapons: The C++ Memory Model and Modern Hardware", Herb Sutter, C++ and Beyond 2012
 
+// rules:
+// 1. AT enqueues requests & makes them atomically available to MT
+// 2. MT receives requests & mutates state accordingly; responds to AT with state important state changes
+// 3. AT uses MT responses to update source states, free resources, etc
+
 pub fn main() !void {
-    // TODO try array of sources, to preserve stable indices; experiment with mailbox-style source parameters
+    // TODO publish responses from MT atomically (to avoid reading torn source states)
+    // TODO record timing stats for any MT frame that processes requests (should take longer)
+    // TODO experiment with array of sources, to preserve stable indices; perhaps that could outperform linear for each source/sound request?
     // TODO per-source gain control
     // TODO gradual global gain control
     // TODO macos backend
@@ -37,10 +44,13 @@ pub fn main() !void {
 
     const Backend = AlsaBackend;
 
-    try Backend.init();
+    // Middleware must init before mixer thread starts to avoid data race
     Middleware.init(alloc);
-    defer Middleware.shutdown();
-    defer Backend.shutdown();
+    try Backend.init();
+    defer {
+        Backend.shutdown();
+        Middleware.shutdown();
+    }
 
     var buffer: [1024]u8 = undefined;
     const stdin = std.io.getStdIn();
@@ -103,6 +113,7 @@ pub fn main() !void {
         } else {
             std.debug.print("Unknown cmd: {s}\n", .{line});
         }
+        Middleware.publishRequests();
         Middleware.processEvents();
         std.debug.print("> ", .{});
     }
@@ -391,8 +402,8 @@ const Middleware = struct {
 
     // Shared by mixer & audio thread
     var globalGain: GainControl = undefined;
-    var requestQueue: MpScRingFifo(MixerRequest, MAX_EVENTS) = undefined;
-    var responseQueue: SpScRingFifo(MixerResponse, MAX_EVENTS) = undefined;
+    var requestQueue: RequestQueue(MixerRequest, MAX_EVENTS) = undefined;
+    var responseQueue: ResponseQueue(MixerResponse, MAX_EVENTS) = undefined;
     var isResponseQueueInOverrun: Atomic(bool) = undefined;
 
     // Performance statistics (DEBUG ONLY)
@@ -403,8 +414,8 @@ const Middleware = struct {
         wavAllocator = allocator;
         sources = Swapback(Source, MAX_SOURCES).init();
         sounds = Swapback(Sound, MAX_SOUNDS).init();
-        requestQueue = MpScRingFifo(MixerRequest, MAX_EVENTS).init();
-        responseQueue = SpScRingFifo(MixerResponse, MAX_EVENTS).init();
+        requestQueue = RequestQueue(MixerRequest, MAX_EVENTS).init();
+        responseQueue = ResponseQueue(MixerResponse, MAX_EVENTS).init();
         isResponseQueueInOverrun = Atomic(bool).init(false);
         globalGain = GainControl.init();
     }
@@ -424,7 +435,7 @@ const Middleware = struct {
             isResponseQueueInOverrun.store(false, .Monotonic);
         }
         debug("targetNs = {d}, processNs = {d}\n", .{ targetNs.load(.SeqCst), processNs.load(.SeqCst) });
-        while (responseQueue.realtimeRead()) |resp| {
+        while (responseQueue.removeFirst()) |resp| {
             debug("resp {d}- {any}\n", .{ resp.id, resp.payload });
             switch (resp.payload) {
                 .soundRegistered => |sound| {
@@ -483,11 +494,14 @@ const Middleware = struct {
         sendRequest(MixerRequest.resumeSource(id));
     }
     inline fn sendRequest(req: MixerRequest) void {
-        requestQueue.spinWrite(req) catch |err| switch (err) {
+        requestQueue.addLast(req) catch |err| switch (err) {
             error.Overrun => {
                 warn("Request queue overrun! Discarding request.\n", .{});
             },
         };
+    }
+    inline fn publishRequests() void {
+        requestQueue.publishToReader();
     }
 
     // Called from the mixer thread to process requests from the audio thread
@@ -570,7 +584,7 @@ const Middleware = struct {
         }
     }
     inline fn mixerSendResponse(resp: MixerResponse) void {
-        responseQueue.realtimeWrite(resp) catch |err| switch (err) {
+        responseQueue.addLast(resp) catch |err| switch (err) {
             error.Overrun => {
                 isResponseQueueInOverrun.store(true, .Monotonic);
             },
@@ -594,7 +608,7 @@ const Middleware = struct {
         if (DEBUG) startTimestamp = std.time.nanoTimestamp();
 
         // process requests from other threads
-        while (requestQueue.realtimeRead()) |req| {
+        while (requestQueue.removeFirst()) |req| {
             switch (req.payload) {
                 .playSound => |params| mixerPlaySound(req, params),
                 .removeSource => |id| mixerRemoveSource(req, id),
@@ -801,7 +815,7 @@ pub fn Swapback(comptime T: anytype, comptime N: comptime_int) type {
 
 // Single-producer, single-consumer, null on underrun, alert on overrun
 // Used to receive responses from the realtime mixer thread, e.g. sound is no longer in use & can be deallocated
-pub fn SpScRingFifo(comptime T: anytype, comptime N: comptime_int) type {
+pub fn ResponseQueue(comptime T: anytype, comptime N: comptime_int) type {
     return struct {
         read: Atomic(usize),
         write: Atomic(usize),
@@ -814,7 +828,7 @@ pub fn SpScRingFifo(comptime T: anytype, comptime N: comptime_int) type {
             };
         }
 
-        pub fn realtimeWrite(self: *@This(), obj: T) !void {
+        pub fn addLast(self: *@This(), obj: T) !void {
             const r = self.read.load(.SeqCst);
             const w = self.write.load(.SeqCst);
             const nextW = (w + 1) % N;
@@ -823,7 +837,7 @@ pub fn SpScRingFifo(comptime T: anytype, comptime N: comptime_int) type {
             self.write.store(nextW, .SeqCst);
         }
 
-        pub fn realtimeRead(self: *@This()) ?T {
+        pub fn removeFirst(self: *@This()) ?T {
             const w = self.write.load(.SeqCst);
             const r = self.read.load(.SeqCst);
             if (r == w) return null; // Underrun
@@ -836,47 +850,41 @@ pub fn SpScRingFifo(comptime T: anytype, comptime N: comptime_int) type {
 
 // Multiple-producer, single-consumer, null on underrun, alert on overrun
 // Used to send notifications to the realtime mixer thread
-pub fn MpScRingFifo(
+pub fn RequestQueue(
     comptime Obj: anytype,
     comptime N: comptime_int,
 ) type {
     return struct {
         read: Atomic(usize),
-        write: Atomic(usize),
-        insert: Atomic(usize),
+        write: usize,
+        publish: Atomic(usize),
         data: [N]Obj = undefined,
 
         pub fn init() @This() {
             return .{
                 .read = Atomic(usize).init(0),
-                .write = Atomic(usize).init(0),
-                .insert = Atomic(usize).init(0),
+                .write = 0,
+                .publish = Atomic(usize).init(0),
             };
         }
 
-        /// Supports multiple, non-realtime producers.
-        pub fn spinWrite(self: *@This(), obj: Obj) !void {
-            var r: usize = undefined;
-            var w: usize = undefined;
-            var nextW: usize = undefined;
-            overrunCheck: while (true) {
-                r = self.read.load(.SeqCst);
-                w = self.write.load(.SeqCst);
-                nextW = (w + 1) % N;
-                if (self.write.compareAndSwap(w, nextW, .SeqCst, .Monotonic) == null) { // advance write head
-                    if (nextW == r) return error.Overrun;
-                    break :overrunCheck;
-                }
-            }
-            self.data[w] = obj;
-            while (self.insert.compareAndSwap(w, nextW, .SeqCst, .Monotonic) != null) {} // advance insert head
+        // Called from non-realtime audio thread; fine if it blocks
+        pub fn addLast(self: *@This(), obj: Obj) !void {
+            var r = self.read.load(.SeqCst);
+            var nextW = (self.write + 1) % N;
+            if (nextW == r) return error.Overrun;
+            self.data[self.write] = obj;
+            self.write = nextW;
+        }
+        pub fn publishToReader(self: *@This()) void {
+            self.publish.store(self.write, .SeqCst);
         }
 
-        // Supports single, realtime consumer.
-        pub fn realtimeRead(self: *@This()) ?Obj {
-            const i = self.insert.load(.SeqCst);
+        // Called from realtime mixer thread; must not block
+        pub fn removeFirst(self: *@This()) ?Obj {
+            const p = self.publish.load(.SeqCst);
             const r = self.read.load(.SeqCst);
-            if (i == r) {
+            if (p == r) {
                 return null;
             }
             const obj = self.data[r];
