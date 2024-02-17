@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("alsa.zig");
+const builtin = @import("builtin");
 const Atomic = std.atomic.Atomic;
 
 const DEBUG = true;
@@ -18,7 +18,6 @@ const DEBUG = true;
 // 3. AT uses MT responses to update source states, free resources, etc
 
 pub fn main() !void {
-    // TODO macos backend
     // TODO standardize audio file format: 48k24b wav
     // TODO can i get away with a single queue shared by both audio & mixer threads?
     // TODO DSP effects on sources
@@ -41,7 +40,11 @@ pub fn main() !void {
     const alloc = gpa.allocator();
     defer _ = gpa.deinit();
 
-    const Backend = AlsaBackend;
+    const Backend = switch (builtin.os.tag) {
+        .linux => AlsaBackend,
+        .macos => MacOsBackend,
+        else => @compileError("no supported backend for taret operating system"),
+    };
 
     // Middleware must init before mixer thread starts to avoid data race
     Middleware.init(alloc);
@@ -415,7 +418,7 @@ const Middleware = struct {
     fn requestPlaySound(params: PlaySoundParams) u64 {
         var modifiedParams = params;
         modifiedParams.id = sourceIdGen.fetchAdd(1, .Monotonic);
-        sendToMixerThread(.{ .playSound = params });
+        sendToMixerThread(.{ .playSound = modifiedParams });
         return modifiedParams.id;
     }
     fn requestRemoveSource(id: u64) void {
@@ -634,7 +637,52 @@ const Middleware = struct {
 
 // BACKENDS
 
+const MacOsBackend = struct {
+    const CoreAudio = @import("core_audio.zig");
+    const AudioUnit = @import("audio_unit.zig");
+
+    const RATE_HZ: c_uint = 44100; // TODO unify with Middleware's RATE_HZ
+    const CHANNELS: c_uint = 2; // TODO unify with MIDDLEWARE's CHANNELS
+
+    var audioUnit: AudioUnit.AudioUnit = undefined;
+
+    fn init() !void {
+        const defaultOutput = try CoreAudio.AudioSystemObject.queryDefaultOutputDevice();
+        // TODO handle default output device change
+        // try CoreAudio.AudioSystemObject.addDefaultOutputDeviceCallback(&onDefaultOutputDeviceChange);
+        const auhal = try AudioUnit.AudioUnit.newAUHAL();
+        errdefer auhal.dispose() catch unreachable;
+        try auhal.setInputStreamFormat(CoreAudio.AudioStreamBasicDescription.lpcm(f32, @floatFromInt(RATE_HZ), @intCast(CHANNELS)));
+        try auhal.setOutputDevice(defaultOutput);
+        try auhal.setRenderCallback(&audioRenderCallback);
+        try auhal.initialize();
+        errdefer auhal.uninitialize() catch unreachable;
+        try auhal.start();
+        audioUnit = auhal;
+    }
+
+    fn shutdown() void {
+        audioUnit.stop() catch unreachable;
+        audioUnit.uninitialize() catch unreachable;
+        audioUnit.dispose() catch unreachable;
+    }
+
+    fn audioRenderCallback(
+        _: [*]u8,
+        _: *AudioUnit.AudioUnitRenderActionFlags,
+        _: *const CoreAudio.AudioTimeStamp,
+        _: u32,
+        inNumberFrames: u32,
+        ioData: ?*CoreAudio.AudioBufferList,
+    ) CoreAudio.OSStatus {
+        const samples: [*]f32 = @ptrCast(@alignCast(ioData.?.mBuffers[0].mData.?));
+        Middleware.render(samples[0..@intCast(inNumberFrames * CHANNELS)]);
+        return 0; // no error
+    }
+};
+
 const AlsaBackend = struct {
+    const c = @import("alsa.zig");
     // sound card sends interrupt to CPU after each period
     // typically, the period size is half the buffer size, i.e. double buffering
     // sound cards have their own constraints on valid values for the period size & buffer size
@@ -643,8 +691,6 @@ const AlsaBackend = struct {
     const RATE_HZ: c_uint = 44100; // TODO unify with Middleware's RATE_HZ
     const CHANNELS: c_uint = 2; // TODO unify with MIDDLEWARE's CHANNELS
     const BUF_FRAMES: c.snd_pcm_uframes_t = 4096; // TODO experiment with larger & smaller buffers + make sure period sizes are at most BUF_FRAMES
-    const MAX_SOUNDS: usize = 4;
-    const MAX_VOICES: usize = 4;
 
     var mixerThread: std.Thread = undefined;
     var shutdownRequested = Atomic(bool).init(false);
@@ -835,6 +881,7 @@ pub fn Fifo(
         }
     };
 }
+
 fn Publishable(comptime T: type) type {
     return struct {
         buffer: [2]T,

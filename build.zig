@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -11,7 +12,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe.linkLibC();
-    exe.linkSystemLibrary("asound"); // TODO okay, but how do i cross-compile when i need this library..?
+    switch (builtin.os.tag) {
+        .linux => {
+            exe.linkSystemLibrary("asound");
+        },
+        .macos => {
+            exe.linkFramework("CoreAudio");
+            exe.linkFramework("AudioUnit");
+        },
+        .windows => @compileError("no windows backend yet"),
+        else => @compileError("no supported backend for taret operating system"),
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
