@@ -12,18 +12,17 @@ const DEBUG = true;
 // - "Real time 101", David Rowland & Fabian Renn Giles, Meeting C++ 2019
 // - "Atomic Weapons: The C++ Memory Model and Modern Hardware", Herb Sutter, C++ and Beyond 2012
 
-// rules:
-// 1. AT enqueues requests & makes them atomically available to MT
-// 2. MT receives requests & mutates state accordingly; responds to AT with state important state changes
-// 3. AT uses MT responses to update source states, free resources, etc
-
 pub fn main() !void {
-    // TODO spatial audio
+    // TODO reimpl FFT & practice derivation
+    // TODO impl pitch shifter w phase vocoder
+    // TODO vector-base amplitude panning + ipsilateral all-pass + contralateral low-pass & delay
+    // TODO binauralization via convolution with interpolated HRTF
+    // TODO heaphones: ipsilateral all-pass + contralateral low-pass & delay
+    // TODO extend to speakers?
     // TODO can i get away with a single queue shared by both audio & mixer threads?
-    // TODO DSP effects on sources
-    // TODO gradual global gain control
+    // TODO ramped global gain control
     // TODO audio engine state machine
-    // TODO less awkward Sound.render() API
+    // TODO less awkward Sound.render() API; bonus points for SIMD
     // TODO set ALSA backend thread priority
     // TODO pin pages being used by mixer?
     // TODO budget memory allocations for sound; actually have a counter for all audio memory usage
@@ -324,6 +323,11 @@ const MessageFromMixerThread = struct {
 };
 
 const Middleware = struct {
+    // design:
+    // 1. Audio Thread enqueues requests & makes them atomically available to Mixer Thread
+    // 2. MT receives requests & mutates state accordingly; responds to AT with state important state changes
+    // 3. AT uses MT responses to update source states, free resources, etc
+
     const RATE_HZ: usize = 44100;
     const CHANNELS: usize = 2;
     const MAX_SOURCES: usize = 16;
