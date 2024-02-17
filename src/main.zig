@@ -18,7 +18,6 @@ const DEBUG = true;
 // 3. AT uses MT responses to update source states, free resources, etc
 
 pub fn main() !void {
-    // TODO encapsulate render frame statistics & make them properly atomic
     // TODO experiment with array of sources, to preserve stable indices; perhaps that could outperform linear for each source/sound request?
     // TODO per-source gain control
     // TODO gradual global gain control
@@ -353,10 +352,18 @@ const Middleware = struct {
     var isAudioThreadInboxFull: Atomic(bool) = undefined;
 
     // Performance statistics (DEBUG ONLY)
-    var lastTargetNs = Atomic(i64).init(0);
-    var lastProcessNs = Atomic(i64).init(0);
-    var lastPublishTargetNs = Atomic(i64).init(0);
-    var lastPublishProcessNs = Atomic(i64).init(0);
+    const MixerInvocationStats = struct {
+        rate: u32,
+        frames: usize,
+        nsDuration: u64,
+
+        fn ratio(self: @This()) f64 {
+            const nsFrames = @as(u64, self.frames * 1_000_000_000 / self.rate);
+            return @as(f64, @floatFromInt(nsFrames)) / @as(f64, @floatFromInt(self.nsDuration));
+        }
+    };
+    var latestStats = Publishable(MixerInvocationStats).init(.{ .rate = RATE_HZ, .frames = 1, .nsDuration = 1 });
+    var publishStats = Publishable(MixerInvocationStats).init(.{ .rate = RATE_HZ, .frames = 1, .nsDuration = 1 });
 
     /// Must be called before the mixer thread starts
     fn init(allocator: std.mem.Allocator) void {
@@ -428,14 +435,10 @@ const Middleware = struct {
             warn("processEvents() too slow or mixer sending too many messages, possibly leaking memory or corrupting playback state", .{});
             isAudioThreadInboxFull.store(false, .Monotonic);
         }
-        {
-            const targetNs = lastTargetNs.load(.SeqCst);
-            const processNs = lastProcessNs.load(.SeqCst);
-            const publishTargetNs = lastPublishTargetNs.load(.SeqCst);
-            const publishProcessNs = lastPublishProcessNs.load(.SeqCst);
-            const publishRatio = @as(f64, @floatFromInt(publishTargetNs)) / @as(f64, @floatFromInt(publishProcessNs));
-            const lastRatio = @as(f64, @floatFromInt(targetNs)) / @as(f64, @floatFromInt(processNs));
-            debug("last = ({d} / {d}, {d:.1}), publish = ({d}/ {d}, {d:.1})\n", .{ processNs, targetNs, lastRatio, publishProcessNs, publishTargetNs, publishRatio });
+        if (DEBUG) {
+            const ls = latestStats.read();
+            const ps = publishStats.read();
+            debug("latest = ({d} x {d:.1}), publish = ({d} x {d:.1})\n", .{ ls.nsDuration, ls.ratio(), ps.nsDuration, ps.ratio() });
         }
         while (audioThreadInbox.receiveMessage()) |resp| {
             debug("resp {d}- {any}\n", .{ resp.id, resp.payload });
@@ -612,13 +615,14 @@ const Middleware = struct {
         }
 
         if (DEBUG) {
-            const processNs: i64 = @intCast(std.time.nanoTimestamp() - startTimestamp);
-            const targetNs: i64 = @intCast(target.len * 1_000_000_000 / RATE_HZ);
-            lastProcessNs.store(processNs, .SeqCst);
-            lastTargetNs.store(targetNs, .SeqCst);
+            const stats = MixerInvocationStats{
+                .rate = RATE_HZ,
+                .frames = target.len / CHANNELS,
+                .nsDuration = @intCast(std.time.nanoTimestamp() - startTimestamp),
+            };
+            latestStats.publish(stats);
             if (didPublish) {
-                lastPublishProcessNs.store(processNs, .SeqCst);
-                lastPublishTargetNs.store(targetNs, .SeqCst);
+                publishStats.publish(stats);
             }
         }
     }
@@ -824,6 +828,32 @@ pub fn Fifo(
             const nextR = (r + 1) % N;
             self.read.store(nextR, .SeqCst);
             return obj;
+        }
+    };
+}
+fn Publishable(comptime T: type) type {
+    return struct {
+        buffer: [2]T,
+        write: Atomic(usize),
+        pub fn init(initialValue: T) @This() {
+            return .{
+                .buffer = [_]T{initialValue} ** 2,
+                .write = Atomic(usize).init(0),
+            };
+        }
+        /// Supports single consumer
+        pub fn read(self: *@This()) T {
+            // TODO don't swap every time? need to have some flag(s) in the write atomic to indicate if the data has been written since last read
+            const w = self.write.load(.SeqCst);
+            const r = 1 - w;
+            const value = self.buffer[r];
+            self.write.store(r, .SeqCst);
+            return value;
+        }
+        /// Supports single producer
+        pub fn publish(self: *@This(), value: T) void {
+            const w = self.write.load(.SeqCst);
+            self.buffer[w] = value;
         }
     };
 }
