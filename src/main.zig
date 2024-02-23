@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Atomic = std.atomic.Atomic;
+const math = @import("math.zig");
 
 const DEBUG = true;
 
@@ -12,14 +13,18 @@ const DEBUG = true;
 // - "Real time 101", David Rowland & Fabian Renn Giles, Meeting C++ 2019
 // - "Atomic Weapons: The C++ Memory Model and Modern Hardware", Herb Sutter, C++ and Beyond 2012
 
+// HRTF: for headphones
+// Panning: for speakers
+// Ambisonics: for speakers, but also used in headphones when cheap scene rotations are required?
+
 pub fn main() !void {
-    // TODO reimpl FFT & practice derivation
-    // TODO impl pitch shifter w phase vocoder
-    // TODO vector-base amplitude panning + ipsilateral all-pass + contralateral low-pass & delay
-    // TODO binauralization via convolution with interpolated HRTF
-    // TODO heaphones: ipsilateral all-pass + contralateral low-pass & delay
-    // TODO extend to speakers?
+    // TODO reimpl pitch shifter w phase vocoder & expose via CLI per-source
+    // TODO vector-base amplitude panning for speakers
+    // TODO headphone binauralization via convolution with interpolated HRIR
+    // TODO ambisonics for speakers
     // TODO can i get away with a single queue shared by both audio & mixer threads?
+    // TODO thread sanitizer?
+    // TODO benchmark FIFO & optimize
     // TODO ramped global gain control
     // TODO audio engine state machine
     // TODO less awkward Sound.render() API; bonus points for SIMD
