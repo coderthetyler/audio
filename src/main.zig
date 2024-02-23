@@ -18,13 +18,14 @@ const DEBUG = true;
 // Ambisonics: for speakers, but also used in headphones when cheap scene rotations are required?
 
 pub fn main() !void {
-    // TODO reimpl pitch shifter w phase vocoder & expose via CLI per-source
+    // TODO practice phase vocoder pitch shifter derivation
+    // TODO reimpl pitch shifter & expose via CLI per-source
     // TODO vector-base amplitude panning for speakers
     // TODO headphone binauralization via convolution with interpolated HRIR
     // TODO ambisonics for speakers
     // TODO can i get away with a single queue shared by both audio & mixer threads?
     // TODO thread sanitizer?
-    // TODO benchmark FIFO & optimize
+    // TODO benchmark FIFO & optimize (fix all the false sharing i've ignored until now)
     // TODO ramped global gain control
     // TODO audio engine state machine
     // TODO less awkward Sound.render() API; bonus points for SIMD
