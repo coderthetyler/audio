@@ -2,10 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Atomic = std.atomic.Atomic;
 const math = @import("math.zig");
+const assert = std.debug.assert;
 
 const DEBUG = true;
 
 // resources:
+// - "A Guide Through The Linux Sound API Jungle", Lennart Poettering
+// - "A Tutorial on Using the ALSA Audio API", Paul Davis
 // - "C++ in the Audio Industry", Timur Doumler, CppCon 2015
 // - "Thread Synchronization In Real-Time Audio Processing with RCU (Read-Copy-Update)", Timur Doumler
 // - "C++ atomics, from basic to advanced", Fedor Pikus, CppCon 2017
@@ -18,14 +21,18 @@ const DEBUG = true;
 // Ambisonics: for speakers, but also used in headphones when cheap scene rotations are required?
 
 pub fn main() !void {
-    // TODO practice phase vocoder pitch shifter derivation
-    // TODO reimpl pitch shifter & expose via CLI per-source
+    // TODO write mono processor that buffers input to FFT block size (start with 256, or ~5ms at 48kHz)
+    // TODO run all rendering through the mono processor
+    // TODO allocate a pitch shifter struct per source on audio thread; pass with source params to mixer thread; clean up when reclaiming source
+    // TODO provide pitch knob on each source
+    // TODO expose per-source pitch knobs via CLI per-source
     // TODO vector-base amplitude panning for speakers
     // TODO headphone binauralization via convolution with interpolated HRIR
     // TODO ambisonics for speakers
     // TODO can i get away with a single queue shared by both audio & mixer threads?
     // TODO thread sanitizer?
     // TODO benchmark FIFO & optimize (fix all the false sharing i've ignored until now)
+    // TODO flush denormals to zero when doing mixing; need to ensure they are restored in the event of a crash
     // TODO ramped global gain control
     // TODO audio engine state machine
     // TODO less awkward Sound.render() API; bonus points for SIMD
@@ -144,15 +151,64 @@ const PlaySoundParams = struct {
     startTime: usize = 0,
     loop: bool = false,
     paused: bool = false,
+    pitch: f32 = 0.0,
 };
 const Source = struct {
+    const FFT_SIZE: usize = 256; // in samples; 256 samples @ 48kHz ~ 5ms latency
+    const FFT_STEP: usize = 64; // 256 / 64 = 4-fold oversampling
+    const FFT_RATIO: usize = FFT_SIZE / FFT_STEP;
+    const WINDOW = w: {
+        var window: [FFT_SIZE]f32 = undefined;
+        for (0..FFT_SIZE) |i| {
+            window[i] = 0.5 * (1 - @cos(std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(FFT_SIZE))));
+        }
+        break :w window;
+    };
+
     id: u64,
-    sound: *Sound,
-    level: f32,
+    // playback state
     time: usize,
+    isComplete: bool = false,
+    sound: *Sound,
+    // pitching state
+    outstanding: usize = 0, // always < FFT_STEP
+    block: usize = 0, // always in range [0, FFT_SIZE/FFT_STEP)
+    input: [FFT_SIZE]f32 = [_]f32{0} ** FFT_SIZE, // TODO allocate separately from Source
+    fft: [FFT_SIZE]math.Complex = [_]math.Complex{math.Complex.of(0)} ** FFT_SIZE,
+    readHead: usize = FFT_STEP, // always in range [0, FFT_SIZE)
+    output: [FFT_SIZE]f32 = [_]f32{0} ** FFT_SIZE,
+    // parameters
+    level: f32,
     loop: bool,
     paused: bool,
-    isComplete: bool = false,
+    pitch: f32,
+
+    inline fn processNextInputBlock(self: *@This()) void {
+        // pull next block of samples from sound
+        const writeHead: usize = self.block * FFT_STEP;
+        const framesWritten = self.sound.read(self.time, self.input[writeHead .. writeHead + FFT_STEP], self.loop, self.level);
+        if (framesWritten < FFT_STEP) { // unlikely branch
+            @memset(self.input[writeHead + framesWritten .. writeHead + FFT_STEP], 0);
+            self.isComplete = true; // TODO delay by FFT_SIZE samples, to ensure last FFT_SIZE samples are drained
+        }
+        self.time += framesWritten;
+
+        // pitch shift
+        for (0..FFT_SIZE) |i|
+            self.fft[i] = math.Complex.of(self.input[(i + writeHead) & (FFT_SIZE - 1)] * WINDOW[i]);
+        math.fft(&self.fft);
+        // TODO pitch shift
+        math.ifft(&self.fft);
+        for (0..FFT_SIZE) |i| {
+            const j = (i + (FFT_SIZE - writeHead)) & (FFT_SIZE - 1);
+            self.output[i] += self.fft[j].real * (WINDOW[j] * 8.0 / 3.0) / FFT_RATIO;
+        }
+
+        // advance block ptr
+        self.block += 1;
+        self.block &= (FFT_RATIO - 1);
+        assert(self.block < FFT_RATIO);
+    }
 
     // Called from mixer thread
     fn render(self: *@This(), target: []f32) void {
@@ -160,11 +216,42 @@ const Source = struct {
             @memset(target, 0.0);
             return;
         }
-        const framesWritten = self.sound.read(self.time, target, self.loop, self.level);
-        if (framesWritten != target.len) {
-            self.isComplete = true;
+
+        // read any outstanding portion of the oldest block
+        var targeti: usize = 0;
+        var readHead: usize = (self.block * FFT_STEP) + (FFT_STEP - self.outstanding);
+        if (self.outstanding <= target.len) {
+            @memcpy(target[0..self.outstanding], self.output[readHead .. readHead + self.outstanding]);
+            @memset(self.output[readHead .. readHead + self.outstanding], 0);
+            targeti += self.outstanding;
+            self.processNextInputBlock();
+        } else {
+            // degenerate branch: working with really small callback sizes OR too-large block sizes
+            @memcpy(target[0..target.len], self.output[readHead .. readHead + target.len]);
+            self.outstanding -= target.len;
+            return;
         }
-        self.time += framesWritten;
+
+        // read as many full blocks as possible into target
+        var remaining = target.len - targeti;
+        while (remaining >= FFT_STEP) {
+            // read oldest full block of output into target
+            readHead = self.block * FFT_STEP;
+            @memcpy(target[targeti .. targeti + FFT_STEP], self.output[readHead..(readHead + FFT_STEP)]);
+            @memset(self.output[readHead..(readHead + FFT_STEP)], 0);
+            targeti += FFT_STEP;
+            remaining -= FFT_STEP;
+            self.processNextInputBlock();
+        }
+        assert(remaining < FFT_STEP);
+
+        // read a portion of next oldest full block into target (the outstanding portion is read on next callback)
+        assert(targeti + remaining == target.len);
+        readHead = self.block * FFT_STEP;
+        @memcpy(target[targeti..], self.output[readHead .. readHead + remaining]);
+        @memset(self.output[readHead .. readHead + remaining], 0.0);
+        self.outstanding = FFT_STEP - remaining;
+        targeti += remaining;
     }
 };
 
@@ -214,9 +301,9 @@ const Sine = struct {
         const SPACING_SEC = 1.0 / @as(f64, @floatFromInt(self.rate));
         var elapsed_time = @as(f64, @floatFromInt(from)) * SPACING_SEC;
         const FRAMES_TO_WRITE = target.len / self.channels;
-        for (0..FRAMES_TO_WRITE) |i| {
-            target[i * 2] = @floatCast(@sin(elapsed_time * 2 * std.math.pi * @as(f64, @floatFromInt(self.hz))));
-            target[i * 2] *= level;
+        for (0..FRAMES_TO_WRITE) |i| { // TODO channels
+            target[i] = @floatCast(@sin(elapsed_time * 2 * std.math.pi * @as(f64, @floatFromInt(self.hz))));
+            target[i] *= level;
             elapsed_time += SPACING_SEC;
         }
         return target.len;
@@ -351,10 +438,11 @@ const Middleware = struct {
     // Owned by mixer thread
     var sources: Swapback(Source, MAX_SOURCES) = undefined;
     var sounds: Swapback(Sound, MAX_SOUNDS) = undefined;
+    var sourceBuffer: [AlsaBackend.BUF_FRAMES]f32 = undefined; // TODO make backend-independent
 
     // Shared by mixer & audio thread
-    var mixerThreadInbox: Fifo(MessageFromAudioThread, MAX_EVENTS) = undefined;
-    var audioThreadInbox: Fifo(MessageFromMixerThread, MAX_EVENTS) = undefined;
+    var mixerThreadInbox: RtFifo(MessageFromAudioThread, MAX_EVENTS) = undefined;
+    var audioThreadInbox: RtFifo(MessageFromMixerThread, MAX_EVENTS) = undefined;
     var isAudioThreadInboxFull: Atomic(bool) = undefined;
 
     // Performance statistics (DEBUG ONLY)
@@ -367,6 +455,10 @@ const Middleware = struct {
             const nsFrames = @as(u64, self.frames * 1_000_000_000 / self.rate);
             return @as(f64, @floatFromInt(nsFrames)) / @as(f64, @floatFromInt(self.nsDuration));
         }
+
+        fn ms(self: @This()) f64 {
+            return @as(f64, @floatFromInt(self.nsDuration)) / 1_000_000.0; // 10^3 ns per us; 10^3 us per ms
+        }
     };
     var latestStats = Publishable(MixerInvocationStats).init(.{ .rate = RATE_HZ, .frames = 1, .nsDuration = 1 });
     var publishStats = Publishable(MixerInvocationStats).init(.{ .rate = RATE_HZ, .frames = 1, .nsDuration = 1 });
@@ -376,8 +468,8 @@ const Middleware = struct {
         wavAllocator = allocator;
         sources = Swapback(Source, MAX_SOURCES).init();
         sounds = Swapback(Sound, MAX_SOUNDS).init();
-        mixerThreadInbox = Fifo(MessageFromAudioThread, MAX_EVENTS).init();
-        audioThreadInbox = Fifo(MessageFromMixerThread, MAX_EVENTS).init();
+        mixerThreadInbox = RtFifo(MessageFromAudioThread, MAX_EVENTS).init();
+        audioThreadInbox = RtFifo(MessageFromMixerThread, MAX_EVENTS).init();
         sourceIdGen = Atomic(u64).init(0);
         soundIdGen = Atomic(u64).init(0);
         isAudioThreadInboxFull = Atomic(bool).init(false);
@@ -444,10 +536,10 @@ const Middleware = struct {
         if (DEBUG) {
             const ls = latestStats.read();
             const ps = publishStats.read();
-            debug("latest = ({d} x {d:.1}), publish = ({d} x {d:.1})\n", .{ ls.nsDuration, ls.ratio(), ps.nsDuration, ps.ratio() });
+            debug("latest = ({d:.2} ms x {d:.1}), publish = ({d:.2} ms x {d:.1})\n", .{ ls.ms(), ls.ratio(), ps.ms(), ps.ratio() });
         }
         while (audioThreadInbox.receiveMessage()) |resp| {
-            debug("resp {d}- {any}\n", .{ resp.id, resp.payload });
+            debug("resp {d}--\n", .{resp.id});
             switch (resp.payload) {
                 .soundRegistered => |sound| {
                     info("! Sound registered: {d}\n", .{sound.id});
@@ -487,6 +579,7 @@ const Middleware = struct {
                 .time = params.startTime,
                 .loop = params.loop,
                 .paused = params.paused,
+                .pitch = params.pitch,
             };
             sources.add(source) catch |err| switch (err) {
                 error.Full => {
@@ -587,7 +680,7 @@ const Middleware = struct {
                 .updateSource => |params| mtUpdateSource(req, params),
             }
         }
-        // remove completed sources
+        // remove completed sources & send them to audio thread for any required deallocation
         var i: usize = 0;
         while (i != sources.len()) {
             if (sources.get(i).isComplete) {
@@ -602,18 +695,28 @@ const Middleware = struct {
         const didPublish = audioThreadInbox.releaseMessages();
 
         // mix sources into output buffer
-        for (0..target.len / CHANNELS) |t| {
-            var mix: f32 = 0;
-            var value = [_]f32{0.0};
-            for (0..sources.len()) |s| {
-                sources.data[s].render(&value);
-                mix += value[0];
+        const sampleCount = target.len / CHANNELS;
+        if (sampleCount > sourceBuffer.len) unreachable; // TODO need some way to guarantee this per-backend
+        @memset(target, 0);
+        for (0..sources.len()) |s| {
+            sources.data[s].render(sourceBuffer[0..sampleCount]);
+            for (0..sampleCount) |t| {
+                target[2 * t + 0] += sourceBuffer[t];
+                target[2 * t + 1] += sourceBuffer[t];
             }
-            mix *= globalGain.next();
-            if (mix > 1.0) mix = 1.0;
-            if (mix < -1.0) mix = -1.0;
-            target[t * 2 + 0] = mix;
-            target[t * 2 + 1] = mix;
+        }
+        for (0..sampleCount) |t| {
+            var mixL = target[2 * t + 0];
+            var mixR = target[2 * t + 1];
+            const gain = globalGain.next();
+            mixL *= gain;
+            mixR *= gain;
+            if (mixL > 1.0) mixL = 1.0;
+            if (mixL < -1.0) mixL = -1.0;
+            if (mixR > 1.0) mixR = 1.0;
+            if (mixR < -1.0) mixR = -1.0;
+            target[t * 2 + 0] = mixL;
+            target[t * 2 + 1] = mixR;
         }
 
         if (DEBUG) {
@@ -832,7 +935,7 @@ pub fn Swapback(comptime T: anytype, comptime N: comptime_int) type {
     };
 }
 
-pub fn Fifo(
+pub fn RtFifo(
     comptime Obj: anytype,
     comptime N: comptime_int,
 ) type {
