@@ -527,8 +527,8 @@ const Middleware = struct {
             return @as(f64, @floatFromInt(nsFrames)) / @as(f64, @floatFromInt(self.nsDuration));
         }
 
-        fn ms(self: @This()) f64 {
-            return @as(f64, @floatFromInt(self.nsDuration)) / 1_000_000.0; // 10^3 ns per us; 10^3 us per ms
+        fn ms_per_s(self: @This()) f64 {
+            return @as(f64, @floatFromInt(self.nsDuration)) / 1_000_000.0 * @as(f64, @floatFromInt(self.frames)) / @as(f64, @floatFromInt(self.rate)); // 10^3 ns per us; 10^3 us per ms
         }
     };
     var latestStats = Publishable(MixerInvocationStats).init(.{ .rate = RATE_HZ, .frames = 1, .nsDuration = 1 });
@@ -607,7 +607,7 @@ const Middleware = struct {
         if (DEBUG) {
             const ls = latestStats.read();
             const ps = publishStats.read();
-            debug("latest = ({d:.2} ms x {d:.1}), publish = ({d:.2} ms x {d:.1})\n", .{ ls.ms(), ls.ratio(), ps.ms(), ps.ratio() });
+            debug("latest = ({d:.2} ms/s x {d:.1}), publish = ({d:.2} ms/s x {d:.1})\n", .{ ls.ms_per_s(), ls.ratio(), ps.ms_per_s(), ps.ratio() });
         }
         while (audioThreadInbox.receiveMessage()) |resp| {
             debug("resp {d}--\n", .{resp.id});
