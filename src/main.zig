@@ -21,11 +21,9 @@ const DEBUG = true;
 // Ambisonics: for speakers, but also used in headphones when cheap scene rotations are required?
 
 pub fn main() !void {
-    // TODO write mono processor that buffers input to FFT block size (start with 256, or ~5ms at 48kHz)
-    // TODO run all rendering through the mono processor
-    // TODO allocate a pitch shifter struct per source on audio thread; pass with source params to mixer thread; clean up when reclaiming source
-    // TODO provide pitch knob on each source
-    // TODO expose per-source pitch knobs via CLI per-source
+    // TODO how to reset phases when changing pitch?
+    // TODO improve performance of FFT impl
+    // TODO make pitching optional; see if it reduces playback time for non-object sources
     // TODO vector-base amplitude panning for speakers
     // TODO headphone binauralization via convolution with interpolated HRIR
     // TODO ambisonics for speakers
@@ -129,6 +127,20 @@ pub fn main() !void {
                     }
                 }
             }
+        } else if (line.len >= 6 + 1 and std.mem.eql(u8, line[0..6], "spitch")) {
+            const hasSpace = blk: {
+                for (6 + 1..line.len - 1) |i| {
+                    if (line[i] == ' ') break :blk i;
+                }
+                break :blk null;
+            };
+            if (hasSpace) |sp| {
+                if (parseInt(line[6 + 1 .. sp])) |id| {
+                    if (parseFloat(line[sp + 1 ..])) |pitch| {
+                        Middleware.requestUpdateSource(.{ .id = id, .pitch = pitch });
+                    }
+                }
+            }
         } else {
             std.debug.print("Unknown cmd: {s}\n", .{line});
         }
@@ -143,6 +155,7 @@ const UpdateSourceParams = struct {
     loop: ?bool = null,
     pause: ?bool = null,
     level: ?f32 = null,
+    pitch: ?f32 = null,
 };
 const PlaySoundParams = struct {
     id: u64 = 0,
@@ -151,18 +164,23 @@ const PlaySoundParams = struct {
     startTime: usize = 0,
     loop: bool = false,
     paused: bool = false,
-    pitch: f32 = 0.0,
+    pitch: f32 = 1,
 };
 const Source = struct {
-    const FFT_SIZE: usize = 256; // in samples; 256 samples @ 48kHz ~ 5ms latency
-    const FFT_STEP: usize = 64; // 256 / 64 = 4-fold oversampling
+    const FFT_SIZE: usize = 2048; // in samples; 256 samples @ 48kHz ~ 5ms latency
+    const FFT_STEP: usize = 256; // 256 / 64 = 4-fold oversampling
     const FFT_RATIO: usize = FFT_SIZE / FFT_STEP;
     const WINDOW = w: {
         var window: [FFT_SIZE]f32 = undefined;
         for (0..FFT_SIZE) |i| {
-            window[i] = 0.5 * (1 - @cos(std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(FFT_SIZE))));
+            @setEvalBranchQuota(2048);
+            window[i] = 0.5 * (1 - @cos(std.math.tau * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(FFT_SIZE)))); // Hann window
         }
         break :w window;
+    };
+    const FrequencyBin = struct {
+        k: f32,
+        mag: f32,
     };
 
     id: u64,
@@ -173,15 +191,24 @@ const Source = struct {
     // pitching state
     outstanding: usize = 0, // always < FFT_STEP
     block: usize = 0, // always in range [0, FFT_SIZE/FFT_STEP)
-    input: [FFT_SIZE]f32 = [_]f32{0} ** FFT_SIZE, // TODO allocate separately from Source
+    // TODO allocate buffers separately from Source
+    input: [FFT_SIZE]f32 = [_]f32{0} ** FFT_SIZE,
     fft: [FFT_SIZE]math.Complex = [_]math.Complex{math.Complex.of(0)} ** FFT_SIZE,
-    readHead: usize = FFT_STEP, // always in range [0, FFT_SIZE)
+    summedPhase: [FFT_SIZE]f32 = [_]f32{0} ** FFT_SIZE,
+    priorPhase: [FFT_SIZE]f32 = [_]f32{0} ** FFT_SIZE,
+    analysis: [FFT_SIZE]FrequencyBin = undefined,
+    synthesis: [FFT_SIZE]FrequencyBin = undefined,
     output: [FFT_SIZE]f32 = [_]f32{0} ** FFT_SIZE,
     // parameters
     level: f32,
     loop: bool,
     paused: bool,
     pitch: f32,
+
+    inline fn wrap(value: f32) f32 {
+        const valuei: i32 = @intFromFloat(value);
+        return value - @as(f32, @floatFromInt(valuei + @rem(valuei, 2)));
+    }
 
     inline fn processNextInputBlock(self: *@This()) void {
         // pull next block of samples from sound
@@ -194,20 +221,64 @@ const Source = struct {
         self.time += framesWritten;
 
         // pitch shift
-        for (0..FFT_SIZE) |i|
-            self.fft[i] = math.Complex.of(self.input[(i + writeHead) & (FFT_SIZE - 1)] * WINDOW[i]);
+        for (0..FFT_SIZE) |k| {
+            const i = (k + writeHead) & (FFT_SIZE - 1);
+            self.fft[k] = math.Complex.of(self.input[i] * WINDOW[k]);
+        }
         math.fft(&self.fft);
-        // TODO pitch shift
+        const FFT_HALF = FFT_SIZE >> 1;
+        for (0..FFT_HALF + 1) |k| {
+            const mag = self.fft[k].magnitude();
+            const phase = self.fft[k].wrapped_phase();
+            const priorPhase = self.priorPhase[k];
+            self.priorPhase[k] = phase;
+            const estBin = blk: {
+                var tmp = phase - priorPhase;
+                tmp -= @as(f32, @floatFromInt(k)) * std.math.tau / @as(f32, @floatFromInt(FFT_RATIO));
+                tmp = wrap(tmp / std.math.pi) * std.math.pi;
+                tmp /= std.math.tau;
+                tmp *= @floatFromInt(FFT_RATIO);
+                tmp += @floatFromInt(k);
+                break :blk tmp;
+            };
+            self.analysis[k] = .{
+                .k = estBin,
+                .mag = mag,
+            };
+        }
+        @memset(&self.synthesis, .{ .k = 0.0, .mag = 0.0 });
+        for (0..FFT_HALF + 1) |k| {
+            const j: usize = @intFromFloat(@as(f32, @floatFromInt(k)) * self.pitch);
+            if (j <= FFT_HALF) {
+                self.synthesis[j].mag += self.analysis[k].mag;
+                self.synthesis[j].k = self.analysis[k].k * self.pitch;
+            }
+        }
+        for (0..FFT_HALF + 1) |k| {
+            const diffRadians = blk: {
+                var tmp = self.synthesis[k].k;
+                tmp -= @as(f32, @floatFromInt(k));
+                tmp /= @as(f32, @floatFromInt(FFT_RATIO));
+                tmp *= std.math.tau;
+                tmp += @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(FFT_RATIO)) * std.math.tau;
+                break :blk tmp;
+            };
+            self.summedPhase[k] += diffRadians;
+            self.summedPhase[k] = wrap(self.summedPhase[k] / std.math.pi) * std.math.pi;
+            self.fft[k] = math.Complex.polar(self.synthesis[k].mag, self.summedPhase[k]);
+        }
+        for (FFT_HALF + 1..FFT_SIZE) |k| {
+            self.fft[k] = self.fft[FFT_SIZE - k].conjugate();
+        }
         math.ifft(&self.fft);
         for (0..FFT_SIZE) |i| {
-            const j = (i + (FFT_SIZE - writeHead)) & (FFT_SIZE - 1);
-            self.output[i] += self.fft[j].real * (WINDOW[j] * 8.0 / 3.0) / FFT_RATIO;
+            const k = (i + (FFT_SIZE - writeHead)) & (FFT_SIZE - 1);
+            self.output[i] += self.fft[k].real * (WINDOW[k] * 8.0 / 3.0) / FFT_RATIO;
         }
 
         // advance block ptr
         self.block += 1;
         self.block &= (FFT_RATIO - 1);
-        assert(self.block < FFT_RATIO);
     }
 
     // Called from mixer thread
@@ -640,6 +711,7 @@ const Middleware = struct {
             if (params.pause) |paused| source.paused = paused;
             if (params.loop) |loop| source.loop = loop;
             if (params.level) |level| source.level = level;
+            if (params.pitch) |pitch| source.pitch = pitch;
         } else {
             // TODO error: no such source
         }
